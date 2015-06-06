@@ -20,11 +20,11 @@ from nose.tools import assert_true, assert_raises, assert_not_equal
 from mne.datasets import testing
 from mne.io.constants import FIFF
 from mne.io import Raw, concatenate_raws, read_raw_fif
+from mne.io.tests.test_raw import _test_concat
 from mne import (concatenate_events, find_events, equalize_channels,
                  compute_proj_raw, pick_types, pick_channels)
-from mne.utils import (_TempDir, requires_nitime, requires_pandas,
-                       requires_mne, run_subprocess, run_tests_if_main,
-                       slow_test)
+from mne.utils import (_TempDir, requires_pandas, slow_test,
+                       requires_mne, run_subprocess, run_tests_if_main)
 from mne.externals.six.moves import zip, cPickle as pickle
 from mne.io.proc_history import _get_sss_rank
 from mne.io.pick import _picks_by_type
@@ -44,6 +44,12 @@ bad_file_works = op.join(base_dir, 'test_bads.txt')
 bad_file_wrong = op.join(base_dir, 'test_wrong_bads.txt')
 hp_fname = op.join(base_dir, 'test_chpi_raw_hp.txt')
 hp_fif_fname = op.join(base_dir, 'test_chpi_raw_sss.fif')
+
+
+@slow_test
+def test_concat():
+    """Test RawFIF concatenation"""
+    _test_concat(read_raw_fif, test_fif_fname)
 
 
 @testing.requires_testing_data
@@ -594,6 +600,17 @@ def test_proj():
         assert_allclose(data_proj_1, data_proj_2)
         assert_allclose(data_proj_2, np.dot(raw._projector, data_proj_2))
 
+    tempdir = _TempDir()
+    out_fname = op.join(tempdir, 'test_raw.fif')
+    raw = read_raw_fif(test_fif_fname, preload=True).crop(0, 0.002, copy=False)
+    raw.pick_types(meg=False, eeg=True)
+    raw.info['projs'] = [raw.info['projs'][-1]]
+    raw._data.fill(0)
+    raw._data[-1] = 1.
+    raw.save(out_fname)
+    raw = read_raw_fif(out_fname, proj=True, preload=False)
+    assert_allclose(raw[:, :][0][:1], raw[0, :][0])
+
 
 @testing.requires_testing_data
 def test_preload_modify():
@@ -833,39 +850,6 @@ def test_raw_copy():
     assert_array_equal(data, copied_data)
     assert_equal(sorted(raw.__dict__.keys()),
                  sorted(copied.__dict__.keys()))
-
-
-@testing.requires_testing_data
-@requires_nitime
-def test_raw_to_nitime():
-    """ Test nitime export """
-    raw = Raw(fif_fname, preload=True)
-    picks_meg = pick_types(raw.info, meg=True, exclude='bads')
-    picks = picks_meg[:4]
-    with warnings.catch_warnings(record=True):
-        raw_ts = raw.to_nitime(picks=picks)
-    assert_equal(raw_ts.data.shape[0], len(picks))
-
-    raw = Raw(fif_fname, preload=False)
-    picks_meg = pick_types(raw.info, meg=True, exclude='bads')
-    picks = picks_meg[:4]
-    with warnings.catch_warnings(record=True):
-        raw_ts = raw.to_nitime(picks=picks)
-    assert_equal(raw_ts.data.shape[0], len(picks))
-
-    raw = Raw(fif_fname, preload=True)
-    picks_meg = pick_types(raw.info, meg=True, exclude='bads')
-    picks = picks_meg[:4]
-    with warnings.catch_warnings(record=True):
-        raw_ts = raw.to_nitime(picks=picks, copy=False)
-    assert_equal(raw_ts.data.shape[0], len(picks))
-
-    raw = Raw(fif_fname, preload=False)
-    picks_meg = pick_types(raw.info, meg=True, exclude='bads')
-    picks = picks_meg[:4]
-    with warnings.catch_warnings(record=True):
-        raw_ts = raw.to_nitime(picks=picks, copy=False)
-    assert_equal(raw_ts.data.shape[0], len(picks))
 
 
 @requires_pandas

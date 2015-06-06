@@ -14,7 +14,7 @@ import numpy as np
 from ..externals.six import string_types
 from ..io.pick import pick_types
 from ..io.proj import setup_proj
-from ..utils import set_config, get_config, verbose, deprecated
+from ..utils import set_config, get_config, verbose
 from ..time_frequency import compute_raw_psd
 from .utils import figure_nobar, _toggle_options, _toggle_proj, tight_layout
 from ..defaults import _handle_default
@@ -152,13 +152,12 @@ def _mouse_click(event, params):
     """Vertical select callback"""
     if event.inaxes is None or event.button != 1:
         return
-    plot_fun = params['plot_fun']
     # vertical scrollbar changed
     if event.inaxes == params['ax_vscroll']:
         ch_start = max(int(event.ydata) - params['n_channels'] // 2, 0)
         if params['ch_start'] != ch_start:
             params['ch_start'] = ch_start
-            plot_fun()
+            params['plot_fun']()
     # horizontal scrollbar changed
     elif event.inaxes == params['ax_hscroll']:
         _plot_raw_time(event.xdata - params['duration'] / 2, params)
@@ -315,6 +314,11 @@ def _plot_traces(params, inds, color, bad_color, lines, event_lines,
     params['ax'].set_yticklabels(tick_list)
     params['vsel_patch'].set_y(params['ch_start'])
     params['fig'].canvas.draw()
+    # XXX This is a hack to make sure this figure gets drawn last
+    # so that when matplotlib goes to calculate bounds we don't get a
+    # CGContextRef error on the MacOSX backend :(
+    if params['fig_proj'] is not None:
+        params['fig_proj'].canvas.draw()
 
 
 def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=None,
@@ -516,7 +520,7 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=None,
                   info=info, projs=projs, remove_dc=remove_dc, ba=ba,
                   n_channels=n_channels, scalings=scalings, types=types,
                   n_times=n_times, event_times=event_times,
-                  event_nums=event_nums, clipping=clipping)
+                  event_nums=event_nums, clipping=clipping, fig_proj=None)
 
     # set up plotting
     size = get_config('MNE_BROWSE_RAW_SIZE')
@@ -623,7 +627,6 @@ def plot_raw(raw, events=None, duration=10.0, start=0.0, n_channels=None,
     _layout_raw(params)
 
     # deal with projectors
-    params['fig_opts'] = None
     if show_options is True:
         _toggle_options(None, params)
 
@@ -778,10 +781,3 @@ def plot_raw_psd(raw, tmin=0., tmax=np.inf, fmin=0, fmax=np.inf, proj=False,
     if show is True:
         plt.show()
     return fig
-
-
-@deprecated("'plot_raw_psds' is deprecated and will be removed in v0.10, "
-            "please use 'plot_raw_psd' instead")
-def plot_raw_psds(*args, **kwargs):
-    plot_raw_psd(*args, **kwargs)
-plot_raw_psds.__doc__ = plot_raw_psd.__doc__

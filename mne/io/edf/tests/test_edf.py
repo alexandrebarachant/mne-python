@@ -3,6 +3,7 @@ from __future__ import print_function
 
 # Authors: Teon Brooks <teon.brooks@gmail.com>
 #          Martin Billinger <martin.billinger@tugraz.at>
+#          Alan Leggitt <alan.leggitt@ucsf.edu>
 #
 # License: BSD (3-clause)
 
@@ -11,15 +12,16 @@ import inspect
 import warnings
 
 from nose.tools import assert_equal, assert_true
-from numpy.testing import assert_array_almost_equal, assert_array_equal
-from numpy.testing import assert_raises, assert_allclose
+from numpy.testing import (assert_array_almost_equal, assert_array_equal,
+                           assert_raises, assert_allclose)
 from scipy import io
 import numpy as np
 
 from mne import pick_types, concatenate_raws
 from mne.externals.six import iterbytes
-from mne.utils import _TempDir
+from mne.utils import _TempDir, run_tests_if_main
 from mne.io import Raw, read_raw_edf, RawArray
+from mne.io.tests.test_raw import _test_concat
 import mne.io.edf.edf as edfmodule
 from mne.event import find_events
 
@@ -37,6 +39,12 @@ edf_uneven_eeglab_path = op.join(data_dir, 'test_uneven_samp.mat')
 
 eog = ['REOG', 'LEOG', 'IEOG']
 misc = ['EXG1', 'EXG5', 'EXG8', 'M1', 'M2']
+
+
+def test_concat():
+    """Test EDF concatenation
+    """
+    _test_concat(read_raw_edf, bdf_path)
 
 
 def test_bdf_data():
@@ -148,19 +156,18 @@ def test_read_segment():
 def test_append():
     """Test appending raw edf objects using Raw.append
     """
-    # Author: Alan Leggitt <alan.leggitt@ucsf.edu>
+    for preload in (True, False):
+        raw = read_raw_edf(bdf_path, preload=False)
+        raw0 = raw.copy()
+        raw1 = raw.copy()
+        raw0.append(raw1)
+        assert_true(2 * len(raw) == len(raw0))
+        assert_allclose(np.tile(raw[:, :][0], (1, 2)), raw0[:, :][0])
+
+    # different types can't combine
     raw = read_raw_edf(bdf_path, preload=True)
     raw0 = raw.copy()
     raw1 = raw.copy()
-    raw0.append(raw1)
-    assert_true(2 * len(raw) == len(raw0))
-    # XXX This is currently failing b/c of non-preload!
-    # assert_allclose(np.tile(raw[:, :][0], (1, 2)), raw0[:, :][0])
-
-    raw = read_raw_edf(bdf_path, preload=False)
-    raw0 = raw.copy()
-    raw1 = raw.copy()
-    assert_raises(RuntimeError, raw0.append, raw1)
     raw2 = RawArray(raw[:, :][0], raw.info)
     assert_raises(ValueError, raw.append, raw2)
 
@@ -193,9 +200,7 @@ def test_edf_annotations():
     """
 
     # test an actual file
-    with warnings.catch_warnings(record=True):  # tal_channel dep
-        warnings.simplefilter('always')
-        raw = read_raw_edf(edf_path, tal_channel=-1, preload=True)
+    raw = read_raw_edf(edf_path, preload=True)
     edf_events = find_events(raw, output='step', shortest_event=0,
                              stim_channel='STI 014')
 
@@ -225,9 +230,7 @@ def test_write_annotations():
     """Test writing raw files when annotations were parsed.
     """
     tempdir = _TempDir()
-    with warnings.catch_warnings(record=True):  # tal_channel dep
-        warnings.simplefilter('always')
-        raw1 = read_raw_edf(edf_path, tal_channel=-1, preload=True)
+    raw1 = read_raw_edf(edf_path, preload=True)
     raw1_file = op.join(tempdir, 'test1-raw.fif')
     raw1.save(raw1_file, overwrite=True, buffer_size_sec=1)
     raw11 = Raw(raw1_file, preload=True)
@@ -238,7 +241,6 @@ def test_write_annotations():
     assert_array_almost_equal(times1, times11)
     assert_equal(sorted(raw1.info.keys()), sorted(raw11.info.keys()))
 
-    with warnings.catch_warnings(record=True):  # tal_channel dep
-        warnings.simplefilter('always')
-        assert_raises(RuntimeError, read_raw_edf,
-                      edf_path, tal_channel=-1, preload=False)
+    assert_raises(RuntimeError, read_raw_edf, edf_path, preload=False)
+
+run_tests_if_main()

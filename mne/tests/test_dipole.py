@@ -4,7 +4,7 @@ from nose.tools import assert_true, assert_equal
 from numpy.testing import assert_allclose
 import warnings
 
-from mne import (read_dip, read_dipole, Dipole, read_forward_solution,
+from mne import (read_dipole, read_forward_solution,
                  convert_forward_solution, read_evokeds, read_cov,
                  SourceEstimate, write_evokeds, fit_dipole,
                  transform_surface_to, make_sphere_model, pick_types)
@@ -35,25 +35,22 @@ def _compare_dipoles(orig, new):
     assert_equal(orig.name, new.name)
 
 
+def _check_dipole(dip, n_dipoles):
+    assert_equal(len(dip), n_dipoles)
+    assert_equal(dip.pos.shape, (n_dipoles, 3))
+    assert_equal(dip.ori.shape, (n_dipoles, 3))
+    assert_equal(dip.gof.shape, (n_dipoles,))
+    assert_equal(dip.amplitude.shape, (n_dipoles,))
+
+
 @testing.requires_testing_data
 def test_io_dipoles():
     """Test IO for .dip files
     """
     tempdir = _TempDir()
-    out_fname = op.join(tempdir, 'temp.dip')
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter('always')
-        times, pos, amplitude, ori, gof = read_dip(fname_dip)
-    assert_true(len(w) >= 1)
-
-    assert_true(pos.shape[1] == 3)
-    assert_true(ori.shape[1] == 3)
-    assert_true(len(times) == len(pos))
-    assert_true(len(times) == gof.size)
-    assert_true(len(times) == amplitude.size)
-
-    dipole = Dipole(times, pos, amplitude, ori, gof, 'ALL')
+    dipole = read_dipole(fname_dip)
     print(dipole)  # test repr
+    out_fname = op.join(tempdir, 'temp.dip')
     dipole.save(out_fname)
     dipole_new = read_dipole(out_fname)
     _compare_dipoles(dipole, dipole_new)
@@ -134,5 +131,23 @@ def test_dipole_fitting():
     assert_true(gc_dists[0] >= gc_dists[1], 'gc-dists (ori): %s' % gc_dists)
     assert_true(amp_errs[0] >= amp_errs[1], 'amplitude errors: %s' % amp_errs)
     # assert_true(gofs[0] <= gofs[1], 'gof: %s' % gofs)
+
+
+@testing.requires_testing_data
+def test_len_index_dipoles():
+    """Test len and indexing of Dipole objects
+    """
+    dipole = read_dipole(fname_dip)
+    d0 = dipole[0]
+    d1 = dipole[:1]
+    _check_dipole(d0, 1)
+    _check_dipole(d1, 1)
+    _compare_dipoles(d0, d1)
+    mask = dipole.gof > 15
+    idx = np.where(mask)[0]
+    d_mask = dipole[mask]
+    _check_dipole(d_mask, 4)
+    _compare_dipoles(d_mask, dipole[idx])
+
 
 run_tests_if_main(False)
