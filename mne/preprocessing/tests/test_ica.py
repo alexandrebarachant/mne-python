@@ -21,7 +21,7 @@ from mne import io, Epochs, read_events, pick_types
 from mne.cov import read_cov
 from mne.preprocessing import (ICA, ica_find_ecg_events, ica_find_eog_events,
                                read_ica, run_ica)
-from mne.preprocessing.ica import get_score_funcs, _check_n_pca_components
+from mne.preprocessing.ica import get_score_funcs
 from mne.io.meas_info import Info
 from mne.utils import set_log_file, _TempDir, requires_sklearn, slow_test
 
@@ -506,14 +506,14 @@ def test_ica_additional():
     ica_chans = [ch for ch in ica_epochs.ch_names if 'ICA' in ch]
     assert_true(ica.n_components_ == len(ica_chans))
     assert_true(ica.n_components_ == ica_epochs.get_data().shape[1])
-    assert_true(ica_epochs.raw is None)
+    assert_true(ica_epochs._raw is None)
     assert_true(ica_epochs.preload is True)
 
     # test float n pca components
     ica.pca_explained_variance_ = np.array([0.2] * 5)
     ica.n_components_ = 0
     for ncomps, expected in [[0.3, 1], [0.9, 4], [1, 1]]:
-        ncomps_ = _check_n_pca_components(ica, ncomps)
+        ncomps_ = ica._check_n_pca_components(ncomps)
         assert_true(ncomps_ == expected)
 
 

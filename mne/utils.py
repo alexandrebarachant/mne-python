@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """Some utility functions"""
 from __future__ import print_function
@@ -548,6 +547,14 @@ def slow_test(f):
     return f
 
 
+@nottest
+def ultra_slow_test(f):
+    """Decorator for ultra slow tests"""
+    f.ultra_slow_test = True
+    f.slow_test = True
+    return f
+
+
 def has_nibabel(vox2ras_tkr=False):
     """Determine if nibabel is installed
 
@@ -778,7 +785,7 @@ def run_subprocess(command, verbose=None, *args, **kwargs):
                "that you use '$HOME' instead of '~'.")
         warnings.warn(msg)
 
-    logger.info("Running subprocess: %s" % str(command))
+    logger.info("Running subprocess: %s" % ' '.join(command))
     try:
         p = subprocess.Popen(command, *args, **kwargs)
     except Exception:
@@ -1475,8 +1482,25 @@ def _url_to_local_path(url, path):
     return destination
 
 
-def _get_stim_channel(stim_channel):
-    """Helper to determine the appropriate stim_channel"""
+def _get_stim_channel(stim_channel, info):
+    """Helper to determine the appropriate stim_channel
+
+    First, 'MNE_STIM_CHANNEL', 'MNE_STIM_CHANNEL_1', 'MNE_STIM_CHANNEL_2', etc.
+    are read. If these are not found, it will fall back to 'STI 014' if
+    present, then fall back to the first channel of type 'stim', if present.
+
+    Parameters
+    ----------
+    stim_channel : str | list of str | None
+        The stim channel selected by the user.
+    info : instance of Info
+        An information structure containing information about the channels.
+
+    Returns
+    -------
+    stim_channel : str | list of str
+        The name of the stim channel(s) to use
+    """
     if stim_channel is not None:
         if not isinstance(stim_channel, list):
             if not isinstance(stim_channel, string_types):
@@ -1489,13 +1513,24 @@ def _get_stim_channel(stim_channel):
     stim_channel = list()
     ch_count = 0
     ch = get_config('MNE_STIM_CHANNEL')
-    while(ch is not None):
+    while(ch is not None and ch in info['ch_names']):
         stim_channel.append(ch)
         ch_count += 1
         ch = get_config('MNE_STIM_CHANNEL_%d' % ch_count)
-    if ch_count == 0:
-        stim_channel = ['STI 014']
-    return stim_channel
+    if ch_count > 0:
+        return stim_channel
+
+    if 'STI 014' in info['ch_names']:
+        return 'STI 014'
+
+    from .io.pick import pick_types
+    stim_channel = pick_types(info, meg=False, ref_meg=False, stim=True)
+    if len(stim_channel) > 0:
+        stim_channel = [info['ch_names'][ch_] for ch_ in stim_channel]
+        return stim_channel
+
+    raise ValueError("No stim channels found. Consider specifying them "
+                     "manually using the 'stim_channel' parameter.")
 
 
 def _check_fname(fname, overwrite):
@@ -1628,7 +1663,8 @@ def run_tests_if_main(measure_mem=False):
         faulthandler.enable()
     except Exception:
         pass
-    mem = int(round(max(memory_usage(-1)))) if measure_mem else -1
+    with warnings.catch_warnings(record=True):  # memory_usage internal dep.
+        mem = int(round(max(memory_usage(-1)))) if measure_mem else -1
     if mem >= 0:
         print('Memory consumption after import: %s' % mem)
     t0 = time.time()
@@ -1647,7 +1683,8 @@ def run_tests_if_main(measure_mem=False):
             try:
                 t1 = time.time()
                 if measure_mem:
-                    mem = int(round(max(memory_usage((val, (), {})))))
+                    with warnings.catch_warnings(record=True):  # dep warn
+                        mem = int(round(max(memory_usage((val, (), {})))))
                 else:
                     val()
                     mem = -1
@@ -1768,3 +1805,41 @@ def _time_mask(times, tmin=None, tmax=None, strict=False):
         mask |= isclose(times, tmin)
         mask |= isclose(times, tmax)
     return mask
+
+
+def random_permutation(n_samples, random_state=None):
+    """Helper to emulate the randperm matlab function.
+
+    It returns a vector containing a random permutation of the
+    integers between 0 and n_samples-1. It returns the same random numbers
+    than randperm matlab function whenever the random_state is the same
+    as the matlab's random seed.
+
+    This function is useful for comparing against matlab scripts
+    which use the randperm function.
+
+    Note: the randperm(n_samples) matlab function generates a random
+    sequence between 1 and n_samples, whereas
+    random_permutation(n_samples, random_state) function generates
+    a random sequence between 0 and n_samples-1, that is:
+    randperm(n_samples) = random_permutation(n_samples, random_state) - 1
+
+    Parameters
+    ----------
+    n_samples : int
+        End point of the sequence to be permuted (excluded, i.e., the end point
+        is equal to n_samples-1)
+    random_state : int | None
+        Random seed for initializing the pseudo-random number generator.
+
+    Returns
+    -------
+    randperm : ndarray, int
+        Randomly permuted sequence between 0 and n-1.
+    """
+    rng = check_random_state(random_state)
+    idx = rng.rand(n_samples)
+
+    randperm = np.argsort(idx)
+
+    return randperm

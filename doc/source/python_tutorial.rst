@@ -18,6 +18,7 @@ What you can do with MNE Python
     - **Averaging** to get Evoked data
     - **Compute SSP pojectors** to remove ECG and EOG artifacts
     - **Compute ICA** to remove artifacts or select latent sources.
+    - **Boundary Element Modeling**: single and three-layer BEM model creation and solution computation.
     - **Forward modeling**: BEM computation and mesh creation (see :ref:`ch_forward`)
     - **Linear inverse solvers** (dSPM, sLORETA, MNE, LCMV, DICS)
     - **Sparse inverse solvers** (L1/L2 mixed norm MxNE, Gamma Map, Time-Frequency MxNE)
@@ -35,8 +36,7 @@ What you can do with MNE Python
 What you're not supposed to do with MNE Python
 ----------------------------------------------
 
-    - **Boundary Element Modeling** use MNE and Freesurfer.
-
+    - **Brain and head surface segmentation** for use with BEM models -- use Freesurfer.
 
 .. note:: Package based on the FIF file format from Neuromag. It can read and convert CTF, BTI/4D, KIT and various EEG formats to FIF.
 
@@ -201,9 +201,9 @@ Define peak-to-peak rejection parameters for gradiometers, magnetometers and EOG
 Read epochs:
 
     >>> epochs = mne.Epochs(raw, events, event_id, tmin, tmax, proj=True, picks=picks, baseline=baseline, preload=False, reject=reject)
+    145 matching events found
     Created an SSP operator (subspace dimension = 4)
     4 projection items activated
-    145 matching events found
     >>> print(epochs)
     <Epochs  |  n_events : 145 (good & bad), tmin : -0.2 (s), tmax : 0.5 (s), baseline : (None, 0),
      'aud_l': 72, 'aud_r': 73>
@@ -257,7 +257,7 @@ It is also possible to read evoked data stored in a fif file:
 
     >>> evoked_fname = data_path + '/MEG/sample/sample_audvis-ave.fif'
     >>> evoked1 = mne.read_evokeds(evoked_fname, condition='Left Auditory', baseline=(None, 0), proj=True) # doctest: +ELLIPSIS
-    Reading .../MNE-sample-data/MEG/sample/sample_audvis-ave.fif ...
+    Reading ...
         Read a total of 4 projection items:
             PCA-v1 (1 x 102) active
             PCA-v2 (1 x 102) active

@@ -1,14 +1,18 @@
 from nose.tools import assert_equal, assert_raises
 from numpy.testing import assert_array_equal
 import numpy as np
+import os.path as op
 
 from mne import (pick_channels_regexp, pick_types, Epochs,
-                 read_forward_solution, rename_channels)
+                 read_forward_solution, rename_channels,
+                 pick_info, __file__)
+
 from mne.io.meas_info import create_info
 from mne.io.array import RawArray
 from mne.io.pick import (channel_indices_by_type, channel_type,
                          pick_types_forward, _picks_by_type)
 from mne.io.constants import FIFF
+from mne.io import Raw
 from mne.datasets import testing
 from mne.forward.tests import test_forward
 
@@ -126,3 +130,37 @@ def test_picks_by_channels():
     pick_list2 = _picks_by_type(raw.info, meg_combined=True)
     assert_equal(len(pick_list), len(pick_list2))
     assert_equal(pick_list2[0][0], 'mag')
+
+
+def test_clean_info_bads():
+    """Test cleaning info['bads'] when bad_channels are excluded """
+
+    raw_file = op.join(op.dirname(__file__), 'io', 'tests', 'data',
+                       'test_raw.fif')
+    raw = Raw(raw_file)
+
+    # select eeg channels
+    picks_eeg = pick_types(raw.info, meg=False, eeg=True)
+
+    # select 3 eeg channels as bads
+    idx_eeg_bad_ch = picks_eeg[[1, 5, 14]]
+    eeg_bad_ch = [raw.info['ch_names'][k] for k in idx_eeg_bad_ch]
+
+    # select meg channels
+    picks_meg = pick_types(raw.info, meg=True, eeg=False)
+
+    # select randomly 3 meg channels as bads
+    idx_meg_bad_ch = picks_meg[[0, 15, 34]]
+    meg_bad_ch = [raw.info['ch_names'][k] for k in idx_meg_bad_ch]
+
+    # simulate the bad channels
+    raw.info['bads'] = eeg_bad_ch + meg_bad_ch
+
+    # simulate the call to pick_info excluding the bad eeg channels
+    info_eeg = pick_info(raw.info, picks_eeg)
+
+    # simulate the call to pick_info excluding the bad meg channels
+    info_meg = pick_info(raw.info, picks_meg)
+
+    assert_equal(info_eeg['bads'], eeg_bad_ch)
+    assert_equal(info_meg['bads'], meg_bad_ch)

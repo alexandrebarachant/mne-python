@@ -12,6 +12,7 @@ import numpy as np
 from .. import pick_types, pick_info
 from ..io.pick import _has_kit_refs
 from ..io import read_info
+from ..io.meas_info import Info
 from ..io.constants import FIFF
 from .forward import Forward, write_forward_solution, _merge_meg_eeg_fwds
 from ._compute_forward import _compute_forwards
@@ -21,7 +22,8 @@ from ..transforms import (invert_transform, transform_surface_to, apply_trans,
 from ..utils import logger, verbose
 from ..source_space import (read_source_spaces, _filter_source_spaces,
                             SourceSpaces)
-from ..surface import read_bem_solution, _normalize_vectors, _bem_find_surface
+from ..surface import _normalize_vectors
+from ..bem import read_bem_solution, _bem_find_surface
 from ..externals.six import string_types
 
 
@@ -436,7 +438,7 @@ def make_forward_solution(info, trans, src, bem, fname=None, meg=True,
 
     # make a new dict with the relevant information
     mri_id = dict(machid=np.zeros(2, np.int32), version=0, secs=0, usecs=0)
-    info = dict(nchan=info['nchan'], chs=info['chs'], comps=info['comps'],
+    info = Info(nchan=info['nchan'], chs=info['chs'], comps=info['comps'],
                 ch_names=info['ch_names'], dev_head_t=info['dev_head_t'],
                 mri_file=trans, mri_id=mri_id, meas_file=info_extra_long,
                 meas_id=None, working_dir=os.getcwd(),

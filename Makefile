@@ -30,19 +30,17 @@ in: inplace # just a shortcut
 inplace:
 	$(PYTHON) setup.py build_ext -i
 
-sample_data: $(CURDIR)/examples/MNE-sample-data/MEG/sample/sample_audvis_raw.fif
-	@echo "Target needs sample data"
+sample_data:
+	@python -c "import mne; mne.datasets.sample.data_path(verbose=True);"
 
 testing_data:
 	@python -c "import mne; mne.datasets.testing.data_path(verbose=True);"
 
-$(CURDIR)/examples/MNE-sample-data/MEG/sample/sample_audvis_raw.fif:
-	wget -c ftp://surfer.nmr.mgh.harvard.edu/pub/data/MNE-sample-data-processed.tar.gz
-	tar xvzf MNE-sample-data-processed.tar.gz
-	mv MNE-sample-data examples/
-	ln -sf ${PWD}/examples/MNE-sample-data ${PWD}/MNE-sample-data
-
 test: in
+	rm -f .coverage
+	$(NOSETESTS) -a '!ultra_slow_test' mne
+
+test-full: in
 	rm -f .coverage
 	$(NOSETESTS) mne
 
@@ -53,10 +51,8 @@ test-no-testing-data: in
 	@MNE_SKIP_TESTING_DATASET_TESTS=true \
 	$(NOSETESTS) mne
 
-
 test-no-sample-with-coverage: in testing_data
 	rm -rf coverage .coverage
-	@MNE_SKIP_SAMPLE_DATASET_TESTS=true \
 	$(NOSETESTS) --with-coverage --cover-package=mne --cover-html --cover-html-dir=coverage
 
 test-doc: sample_data testing_data

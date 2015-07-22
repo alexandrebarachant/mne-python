@@ -34,10 +34,10 @@ from .io.write import (start_file, start_block, end_file, end_block,
                        write_id)
 from .io.base import ToDataFrameMixin
 
-aspect_dict = {'average': FIFF.FIFFV_ASPECT_AVERAGE,
-               'standard_error': FIFF.FIFFV_ASPECT_STD_ERR}
-aspect_rev = {str(FIFF.FIFFV_ASPECT_AVERAGE): 'average',
-              str(FIFF.FIFFV_ASPECT_STD_ERR): 'standard_error'}
+_aspect_dict = {'average': FIFF.FIFFV_ASPECT_AVERAGE,
+                'standard_error': FIFF.FIFFV_ASPECT_STD_ERR}
+_aspect_rev = {str(FIFF.FIFFV_ASPECT_AVERAGE): 'average',
+               str(FIFF.FIFFV_ASPECT_STD_ERR): 'standard_error'}
 
 
 class Evoked(ProjMixin, ContainsMixin, PickDropChannelsMixin,
@@ -121,13 +121,14 @@ class Evoked(ProjMixin, ContainsMixin, PickDropChannelsMixin,
 
             # find string-based entry
             if isinstance(condition, string_types):
-                if kind not in aspect_dict.keys():
+                if kind not in _aspect_dict.keys():
                     raise ValueError('kind must be "average" or '
                                      '"standard_error"')
 
                 comments, aspect_kinds, t = _get_entries(fid, evoked_node)
                 goods = np.logical_and(in1d(comments, [condition]),
-                                       in1d(aspect_kinds, [aspect_dict[kind]]))
+                                       in1d(aspect_kinds,
+                                            [_aspect_dict[kind]]))
                 found_cond = np.where(goods)[0]
                 if len(found_cond) != 1:
                     raise ValueError('condition "%s" (%s) not found, out of '
@@ -258,7 +259,7 @@ class Evoked(ProjMixin, ContainsMixin, PickDropChannelsMixin,
         # Put the rest together all together
         self.nave = nave
         self._aspect_kind = aspect_kind
-        self.kind = aspect_rev.get(str(self._aspect_kind), 'Unknown')
+        self.kind = _aspect_rev.get(str(self._aspect_kind), 'Unknown')
         self.first = first
         self.last = last
         self.comment = comment
@@ -442,15 +443,17 @@ class Evoked(ProjMixin, ContainsMixin, PickDropChannelsMixin,
                      cbar_fmt="%3.1f", time_format='%01d ms', proj=False,
                      show=True, show_names=False, title=None, mask=None,
                      mask_params=None, outlines='head', contours=6,
-                     image_interp='bilinear', average=None, head_pos=None):
+                     image_interp='bilinear', average=None, head_pos=None,
+                     axes=None):
         """Plot topographic maps of specific time points
 
         Parameters
         ----------
         times : float | array of floats | None.
-            The time point(s) to plot. If None, 10 topographies will be shown
-            will a regular time spacing between the first and last time
-            instant.
+            The time point(s) to plot. If None, the number of ``axes``
+            determines the amount of time point(s). If ``axes`` is also None,
+            10 topographies will be shown with a regular time spacing between
+            the first and last time instant.
         ch_type : 'mag' | 'grad' | 'planar1' | 'planar2' | 'eeg' | None
             The channel type to plot. For 'grad', the gradiometers are collec-
             ted in pairs and the RMS for each pair is plotted.
@@ -543,6 +546,11 @@ class Evoked(ProjMixin, ContainsMixin, PickDropChannelsMixin,
             the head circle. If dict, can have entries 'center' (tuple) and
             'scale' (tuple) for what the center and scale of the head should be
             relative to the electrode locations.
+        axes : instance of Axes | list | None
+            The axes to plot to. If list, the list must be a list of Axes of
+            the same length as ``times`` (unless ``times`` is None). If
+            instance of Axes, ``times`` must be a float or a list of one float.
+            Defaults to None.
         """
         return plot_evoked_topomap(self, times=times, ch_type=ch_type,
                                    layout=layout, vmin=vmin,
@@ -556,7 +564,8 @@ class Evoked(ProjMixin, ContainsMixin, PickDropChannelsMixin,
                                    mask_params=mask_params,
                                    outlines=outlines, contours=contours,
                                    image_interp=image_interp,
-                                   average=average, head_pos=head_pos)
+                                   average=average, head_pos=head_pos,
+                                   axes=axes)
 
     def plot_field(self, surf_maps, time=None, time_label='t = %0.0f ms',
                    n_jobs=1):
@@ -841,9 +850,8 @@ class EvokedArray(Evoked):
         # XXX: this should use round and be tested
         self.first = int(tmin * info['sfreq'])
         self.last = self.first + np.shape(data)[-1] - 1
-        self.times = np.arange(self.first, self.last + 1, dtype=np.float)
-        self.times /= info['sfreq']
-
+        self.times = np.arange(self.first, self.last + 1,
+                               dtype=np.float) / info['sfreq']
         self.info = info
         self.nave = nave
         self.kind = kind
@@ -852,9 +860,9 @@ class EvokedArray(Evoked):
         self.verbose = verbose
         self._projector = None
         if self.kind == 'average':
-            self._aspect_kind = aspect_dict['average']
+            self._aspect_kind = _aspect_dict['average']
         else:
-            self._aspect_kind = aspect_dict['standard_error']
+            self._aspect_kind = _aspect_dict['standard_error']
 
 
 def _get_entries(fid, evoked_node):
@@ -881,7 +889,7 @@ def _get_entries(fid, evoked_node):
         fid.close()
         raise ValueError('Dataset names in FIF file '
                          'could not be found.')
-    t = [aspect_rev.get(str(a), 'Unknown') for a in aspect_kinds]
+    t = [_aspect_rev.get(str(a), 'Unknown') for a in aspect_kinds]
     t = ['"' + c + '" (' + tt + ')' for tt, c in zip(t, comments)]
     t = '  ' + '\n  '.join(t)
     return comments, aspect_kinds, t

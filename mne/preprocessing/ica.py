@@ -683,7 +683,7 @@ class ICA(ContainsMixin):
 
         self._export_info(out.info, epochs, add_channels)
         out.preload = True
-        out.raw = None
+        out._raw = None
         out._projector = None
 
         return out
@@ -1186,8 +1186,7 @@ class ICA(ContainsMixin):
         else:
             exclude = list(set(self.exclude + list(exclude)))
 
-        _n_pca_comp = _check_n_pca_components(self, self.n_pca_components,
-                                              self.verbose)
+        _n_pca_comp = self._check_n_pca_components(self.n_pca_components)
 
         if not(self.n_components_ <= _n_pca_comp <= self.max_pca_components):
             raise ValueError('n_pca_components must be >= '
@@ -1336,7 +1335,7 @@ class ICA(ContainsMixin):
                                    head_pos=head_pos)
 
     def plot_sources(self, inst, picks=None, exclude=None, start=None,
-                     stop=None, title=None, show=True):
+                     stop=None, title=None, show=True, block=False):
         """Plot estimated latent sources given the unmixing matrix.
 
         Typical usecases:
@@ -1364,15 +1363,32 @@ class ICA(ContainsMixin):
             The figure title. If None a default is provided.
         show : bool
             If True, all open plots will be shown.
+        block : bool
+            Whether to halt program execution until the figure is closed.
+            Useful for interactive selection of components in raw and epoch
+            plotter. For evoked, this parameter has no effect. Defaults to
+            False.
 
         Returns
         -------
         fig : instance of pyplot.Figure
             The figure.
+
+        Notes
+        -----
+        For raw and epoch instances, it is possible to select components for
+        exclusion by clicking on the line. The selected components are added to
+        ``ica.exclude`` on close. The independent components can be viewed as
+        topographies by clicking on the component name on the left of of the
+        main axes. The topography view tries to infer the correct electrode
+        layout from the data. This should work at least for Neuromag data.
+
+        .. versionadded:: 0.10.0
         """
 
         return plot_ica_sources(self, inst=inst, picks=picks, exclude=exclude,
-                                title=title, start=start, stop=stop, show=show)
+                                title=title, start=start, stop=stop, show=show,
+                                block=block)
 
     def plot_scores(self, scores, exclude=None, axhline=None,
                     title='ICA component scores', figsize=(12, 6),
@@ -1557,22 +1573,21 @@ class ICA(ContainsMixin):
 
         return self
 
+    @verbose
+    def _check_n_pca_components(self, _n_pca_comp, verbose=None):
+        """Aux function"""
+        if isinstance(_n_pca_comp, float):
+            _n_pca_comp = ((self.pca_explained_variance_ /
+                           self.pca_explained_variance_.sum()).cumsum() <=
+                           _n_pca_comp).sum()
+            logger.info('Selected %i PCA components by explained '
+                        'variance' % _n_pca_comp)
+        elif _n_pca_comp is None:
+            _n_pca_comp = self.max_pca_components
+        elif _n_pca_comp < self.n_components_:
+            _n_pca_comp = self.n_components_
 
-@verbose
-def _check_n_pca_components(ica, _n_pca_comp, verbose=None):
-    """Aux function"""
-    if isinstance(_n_pca_comp, float):
-        _n_pca_comp = ((ica.pca_explained_variance_ /
-                       ica.pca_explained_variance_.sum()).cumsum() <=
-                       _n_pca_comp).sum()
-        logger.info('Selected %i PCA components by explained '
-                    'variance' % _n_pca_comp)
-    elif _n_pca_comp is None:
-        _n_pca_comp = ica.max_pca_components
-    elif _n_pca_comp < ica.n_components_:
-        _n_pca_comp = ica.n_components_
-
-    return _n_pca_comp
+        return _n_pca_comp
 
 
 def _check_start_stop(raw, start, stop):

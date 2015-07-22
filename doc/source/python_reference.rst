@@ -48,6 +48,7 @@ Classes
    decoding.FilterEstimator
    decoding.PSDEstimator
    decoding.GeneralizationAcrossTime
+   decoding.TimeDecoding
    realtime.RtEpochs
    realtime.RtClient
    realtime.MockRtClient
@@ -159,7 +160,8 @@ Functions:
    read_trans
    save_stc_as_volume
    write_labels_to_annot
-   write_bem_surface
+   write_bem_solution
+   write_bem_surfaces
    write_cov
    write_events
    write_evokeds
@@ -289,6 +291,7 @@ Functions:
    plot_dipole_amplitudes
    plot_dipole_locations
    plot_drop_log
+   plot_epochs
    plot_events
    plot_evoked
    plot_evoked_image
@@ -379,6 +382,7 @@ Manipulate channels and set sensors locations for processing and plotting:
    ica_find_eog_events
    read_ica
    run_ica
+   maxwell_filter
 
 EEG referencing:
 
@@ -542,6 +546,8 @@ Functions:
    average_forward_solutions
    convert_forward_solution
    do_forward_solution
+   make_bem_model
+   make_bem_solution
    make_forward_solution
    make_field_map
    make_sphere_model
@@ -555,6 +561,14 @@ Functions:
    setup_volume_source_space
    write_bem_surface
    write_trans
+
+.. currentmodule:: mne.bem
+
+.. autosummary::
+   :toctree: generated/
+   :template: function.rst
+
+   make_watershed_bem
 
 .. currentmodule:: mne.forward
 

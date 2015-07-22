@@ -17,8 +17,9 @@ from .io.write import (start_block, end_block, write_int,
                        write_float_sparse_rcs, write_string,
                        write_float_matrix, write_int_matrix,
                        write_coord_trans, start_file, end_file, write_id)
+from .bem import read_bem_surfaces
 from .surface import (read_surface, _create_surf_spacing, _get_ico_surface,
-                      _tessellate_sphere_surf, read_bem_surfaces,
+                      _tessellate_sphere_surf,
                       _read_surface_geom, _normalize_vectors,
                       _complete_surface_info, _compute_nearest,
                       fast_cross_3d, _fast_cross_nd_sum)
@@ -2195,13 +2196,13 @@ def add_source_space_distances(src, dist_limit=np.inf, n_jobs=1, verbose=None):
         min_dists.append(min_dist)
         min_idxs.append(min_idx)
         # now actually deal with distances, convert to sparse representation
-        d = np.concatenate([dd[0] for dd in d], axis=0)
-        i, j = np.meshgrid(s['vertno'], s['vertno'])
-        d = d.ravel()
-        i = i.ravel()
-        j = j.ravel()
+        d = np.array([dd[0] for dd in d]).ravel()  # already float32
         idx = d > 0
-        d = sparse.csr_matrix((d[idx], (i[idx], j[idx])),
+        d = d[idx]
+        i, j = np.meshgrid(s['vertno'], s['vertno'])
+        i = i.ravel()[idx]
+        j = j.ravel()[idx]
+        d = sparse.csr_matrix((d, (i, j)),
                               shape=(s['np'], s['np']), dtype=np.float32)
         s['dist'] = d
         s['dist_limit'] = np.array([dist_limit], np.float32)
@@ -2224,10 +2225,11 @@ def _do_src_distances(con, vertno, run_inds, limit):
         func = partial(sparse.csgraph.dijkstra, limit=limit)
     else:
         func = sparse.csgraph.dijkstra
-    chunk_size = 100  # save memory by chunking (only a little slower)
+    chunk_size = 20  # save memory by chunking (only a little slower)
     lims = np.r_[np.arange(0, len(run_inds), chunk_size), len(run_inds)]
     n_chunks = len(lims) - 1
-    d = np.empty((len(run_inds), len(vertno)))
+    # eventually we want this in float32, so save memory by only storing 32-bit
+    d = np.empty((len(run_inds), len(vertno)), np.float32)
     min_dist = np.empty((n_chunks, con.shape[0]))
     min_idx = np.empty((n_chunks, con.shape[0]), np.int32)
     range_idx = np.arange(con.shape[0])

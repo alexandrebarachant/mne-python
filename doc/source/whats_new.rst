@@ -1,5 +1,8 @@
 What's new
 ==========
+..
+    Note, we are now using links to highlight new functions and classes.
+    Please be sure to follow the examples below like :func:`mne.stats.f_mway_rm`, so the whats_new page will have a link to the function/class documentation.
 
 
 Current
@@ -7,10 +10,58 @@ Current
 
 Changelog
 ~~~~~~~~~
-    - Add support for generalized M-way repeated measures ANOVA for fully balanced designs by `Denis Engemann`_
 
+    - Add support for generalized M-way repeated measures ANOVA for fully balanced designs with :func:`mne.stats.f_mway_rm` by `Denis Engemann`_
+
+    - Add epochs browser to interactively view and manipulate epochs with :func:`mne.viz.plot_epochs` by `Jaakko Leppakangas`_
+
+    - Speed up TF-MxNE inverse solver with block coordinate descent by `Daniel Strohmeier`_ and `Yousra Bekhti`_
+
+    - Speed up zero-phase overlap-add (default) filtering by a factor of up to 2 using linearity by `Ross Maddox`_ and `Eric Larson`_
+
+    - Add support for scaling and adjusting the number of channels/time per view by `Jaakko Leppakangas`_
+
+    - Add support to toggle the show/hide state of all sections with a single keypress ('t') in :class:`mne.report.Report` by `Mainak Jas`_
+
+    - Add support for BEM model creation :func:`mne.make_bem_model` by `Eric Larson`_
+
+    - Add support for BEM solution computation :func:`mne.make_bem_solution` by `Eric Larson`_
+
+    - Add ICA plotters for raw and epoch components by `Jaakko Leppakangas`_
+
+    - Add new object :class:`mne.decoding.TimeDecoding` for decoding sensors' evoked response across time by `Jean-Remi King`_
+
+    - Add command ``mne freeview_bem_surfaces`` to quickly check BEM surfaces with Freeview by `Alex Gramfort`_.
+
+    - Add support for splitting epochs into multiple files in :func:`mne.Epochs.save` by `Mainak Jas`_ and `Alexandre Gramfort`_
+
+    - Add support for jointly resampling a raw object and event matrix to avoid issues with resampling status channels by `Marijn van Vliet`
+
+    - Add new method :class:`mne.preprocessing.Xdawn` for denoising and
+    decoding of ERP/ERF by `Alexandre Barachant`_
+
+    - Add support for plotting patterns/filters in :class:`mne.decoding.csp.CSP` and :class:`mne.decoding.base.LinearModel` by `Romain Trachel`_
+
+    - Add new object :class:`mne.decoding.base.LinearModel` for decoding M/EEG data and interpreting coefficients of linear models with patterns attribute by `Romain Trachel`_ and `Alexandre Gramfort`_
+
+
+BUG
+~~~
+
+    - Fix ``mne.io.add_reference_channels`` not setting ``info[nchan]`` correctly by `Federico Raimondo`_
+
+    - Fix ``mne.stats.bonferroni_correction`` reject mask output to use corrected p-values by `Denis Engemann`_
+
+    - Fix FFT filter artifacts when using short windows in overlap-add by `Eric Larson`_
+
+    - Fix picking channels from forward operator could return a channel ordering different from ``info['chs']`` by `Chris Bailey`_
+
+    - Fix dropping of events after downsampling stim channels by `Marijn van Vliet`
 
 .. _changes_0_9:
+
+Version 0.9
+-----------
 
 Changelog
 ~~~~~~~~~
@@ -1036,3 +1087,9 @@ of commits):
 .. _Mark Wronkiewicz: http://ilabs.washington.edu/graduate-students/bio/i-labs-mark-wronkiewicz
 
 .. _Sébastien Marti: http://www.researchgate.net/profile/Sebastien_Marti
+
+.. _Chris Bailey: https://github.com/cjayb
+
+.. _Ross Maddox: http://faculty.washington.edu/rkmaddox/
+
+.. _Alexandre Barachant: http://alexandre.barachant.org

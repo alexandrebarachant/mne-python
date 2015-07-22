@@ -413,6 +413,17 @@ header_template = Template(u"""
 {{include}}
 <script type="text/javascript">
 
+        var toggle_state = false;
+        $(document).on('keydown', function (event) {
+            if (event.which == 84){
+                if (!toggle_state)
+                    $('.has_toggle').trigger('click');
+                else if (toggle_state)
+                    $('.has_toggle').trigger('click');
+            toggle_state = !toggle_state;
+            }
+        });
+
         function togglebutton(class_name){
             $(class_name).toggle();
 
@@ -524,7 +535,8 @@ div.footer {
 
         <li class="active {{sectionvars[section]}}-btn">
            <a href="javascript:void(0)"
-           onclick="togglebutton('.{{sectionvars[section]}}')">
+           onclick="togglebutton('.{{sectionvars[section]}}')"
+           class="has_toggle">
     {{section if section != 'mri' else 'MRI'}}
            </a>
         </li>
@@ -544,6 +556,13 @@ footer_template = HTMLTemplate(u"""
       Powered by <a href="http://martinos.org/mne">MNE.
 </div>
 </html>
+""")
+
+html_template = Template(u"""
+<li class="{{div_klass}}" id="{{id}}">
+    <h4>{{caption}}</h4>
+    <div class="thumbnail">{{html}}</div>
+</li>
 """)
 
 image_template = Template(u"""
@@ -709,6 +728,12 @@ class Report(object):
         timepoints t such that a <= t <= b.
     verbose : bool, str, int, or None
         If not None, override default verbose level (see mne.verbose).
+
+    Notes
+    -----
+    To toggle the show/hide state of all sections in the html report, press 't'
+
+    .. versionadded:: 0.8.0
     """
 
     def __init__(self, info_fname=None, subjects_dir=None,
@@ -923,10 +948,14 @@ class Report(object):
         for html, caption in zip(htmls, captions):
             caption = 'custom plot' if caption == '' else caption
             sectionvar = self._sectionvars[section]
+            global_id = self._get_id()
+            div_klass = self._sectionvars[section]
 
             self.fnames.append('%s-#-%s-#-custom' % (caption, sectionvar))
             self._sectionlabels.append(sectionvar)
-            self.html.append(html)
+            self.html.append(
+                html_template.substitute(div_klass=div_klass, id=global_id,
+                                         caption=caption, html=html))
 
     def add_bem_to_section(self, subject, caption='BEM', section='bem',
                            decim=2, n_jobs=1, subjects_dir=None):
@@ -958,7 +987,7 @@ class Report(object):
         html = self._render_bem(subject=subject, subjects_dir=subjects_dir,
                                 decim=decim, n_jobs=n_jobs, section=section,
                                 caption=caption)
-        html, caption = self._validate_input(html, caption, section)
+        html, caption, _ = self._validate_input(html, caption, section)
         sectionvar = self._sectionvars[section]
 
         self.fnames.append('%s-#-%s-#-custom' % (caption[0], sectionvar))
@@ -1135,7 +1164,7 @@ class Report(object):
         else:
             fname = op.realpath(fname)
 
-        self._render_toc(verbose=self.verbose)
+        self._render_toc()
 
         html = footer_template.substitute(date=time.strftime("%B %d, %Y"))
         self.html.append(html)
