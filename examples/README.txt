@@ -1,4 +1,8 @@
-Introductory examples
----------------------
+.. _general_examples:
 
-Introductory examples to MNE.
+Examples Gallery
+================
+
+.. contents:: Contents
+   :local:
+   :depth: 2

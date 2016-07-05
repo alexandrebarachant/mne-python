@@ -12,19 +12,18 @@ from __future__ import print_function
 # License: Simplified BSD
 
 import copy
-import warnings
 from glob import glob
-import os.path as op
 from itertools import cycle
+import os.path as op
 
 import numpy as np
 from scipy import linalg
 
 from ..surface import read_surface
 from ..io.proj import make_projector
-from ..utils import logger, verbose, get_subjects_dir
+from ..utils import logger, verbose, get_subjects_dir, warn
 from ..io.pick import pick_types
-from .utils import tight_layout, COLORS, _prepare_trellis
+from .utils import tight_layout, COLORS, _prepare_trellis, plt_show
 
 
 @verbose
@@ -124,9 +123,7 @@ def plot_cov(cov, info, exclude=[], colorbar=True, proj=False, show_svd=True,
             plt.title(name)
             tight_layout(fig=fig_svd)
 
-    if show:
-        plt.show()
-
+    plt_show(show)
     return fig_cov, fig_svd
 
 
@@ -236,9 +233,7 @@ def plot_source_spectrogram(stcs, freq_bins, tmin=None, tmax=None,
         plt.barh(lower_bound, time_bounds[-1] - time_bounds[0], upper_bound -
                  lower_bound, time_bounds[0], color='#666666')
 
-    if show:
-        plt.show()
-
+    plt_show(show)
     return fig
 
 
@@ -332,9 +327,7 @@ def _plot_mri_contours(mri_fname, surf_fnames, orientation='coronal',
 
     plt.subplots_adjust(left=0., bottom=0., right=1., top=1., wspace=0.,
                         hspace=0.)
-    if show:
-        plt.show()
-
+    plt_show(show)
     return fig
 
 
@@ -455,15 +448,15 @@ def plot_events(events, sfreq=None, first_samp=0, color=None, event_id=None,
 
         for this_event in unique_events:
             if this_event not in unique_events_id:
-                warnings.warn('event %s missing from event_id will be ignored.'
-                              % this_event)
+                warn('event %s missing from event_id will be ignored'
+                     % this_event)
     else:
         unique_events_id = unique_events
 
     if color is None:
         if len(unique_events) > len(COLORS):
-            warnings.warn('More events than colors available. '
-                          'You should pass a list of unique colors.')
+            warn('More events than colors available. You should pass a list '
+                 'of unique colors.')
         colors = cycle(COLORS)
         color = dict()
         for this_event, this_color in zip(unique_events_id, colors):
@@ -476,8 +469,8 @@ def plot_events(events, sfreq=None, first_samp=0, color=None, event_id=None,
 
         for this_event in unique_events_id:
             if this_event not in color:
-                warnings.warn('Color is not available for event %d. Default '
-                              'colors will be used.' % this_event)
+                warn('Color is not available for event %d. Default colors '
+                     'will be used.' % this_event)
 
     import matplotlib.pyplot as plt
 
@@ -524,9 +517,7 @@ def plot_events(events, sfreq=None, first_samp=0, color=None, event_id=None,
         ax.set_position([box.x0, box.y0, box.width * 0.8, box.height])
         ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
         fig.canvas.draw()
-    if show:
-        plt.show()
-
+    plt_show(show)
     return fig
 
 
@@ -576,5 +567,5 @@ def plot_dipole_amplitudes(dipoles, colors=None, show=True):
     ax.set_xlabel('Time (sec)')
     ax.set_ylabel('Amplitude (nAm)')
     if show:
-        fig.show()
+        fig.show(warn=False)
     return fig

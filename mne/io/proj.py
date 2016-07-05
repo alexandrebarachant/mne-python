@@ -6,11 +6,11 @@
 # License: BSD (3-clause)
 
 from copy import deepcopy
+from itertools import count
 from math import sqrt
+
 import numpy as np
 from scipy import linalg
-from itertools import count
-import warnings
 
 from .tree import dir_tree_find
 from .tag import find_tag
@@ -18,7 +18,7 @@ from .constants import FIFF
 from .pick import pick_types
 from .write import (write_int, write_float, write_string, write_name_list,
                     write_float_matrix, end_block, start_block)
-from ..utils import logger, verbose
+from ..utils import logger, verbose, warn
 from ..externals.six import string_types
 
 
@@ -64,7 +64,8 @@ class ProjMixin(object):
         return (len(self.info['projs']) > 0 and
                 all(p['active'] for p in self.info['projs']))
 
-    def add_proj(self, projs, remove_existing=False):
+    @verbose
+    def add_proj(self, projs, remove_existing=False, verbose=None):
         """Add SSP projection vectors
 
         Parameters
@@ -73,6 +74,8 @@ class ProjMixin(object):
             List with projection vectors.
         remove_existing : bool
             Remove the projection vectors currently in the file.
+        verbose : bool, str, int, or None
+            If not None, override default verbose level (see mne.verbose).
 
         Returns
         -------
@@ -97,7 +100,18 @@ class ProjMixin(object):
             self.info['projs'] = projs
         else:
             self.info['projs'].extend(projs)
+        # We don't want to add projectors that are activated again.
+        self.info['projs'] = _uniquify_projs(self.info['projs'],
+                                             check_active=False, sort=False)
+        return self
 
+    def add_eeg_average_proj(self):
+        """Add an average EEG reference projector if one does not exist
+        """
+        if _needs_eeg_average_ref_proj(self.info):
+            # Don't set as active, since we haven't applied it
+            eeg_proj = make_eeg_average_ref_proj(self.info, activate=False)
+            self.add_proj(eeg_proj)
         return self
 
     def apply_proj(self):
@@ -128,15 +142,17 @@ class ProjMixin(object):
         self : instance of Raw | Epochs | Evoked
             The instance.
         """
+        from ..epochs import _BaseEpochs
+        from .base import _BaseRaw
         if self.info['projs'] is None or len(self.info['projs']) == 0:
-            logger.info('No projector specified for this dataset.'
+            logger.info('No projector specified for this dataset. '
                         'Please consider the method self.add_proj.')
             return self
 
         # Exit delayed mode if you apply proj
-        if getattr(self, '_delayed_proj', False):
+        if isinstance(self, _BaseEpochs) and self._do_delayed_proj:
             logger.info('Leaving delayed SSP mode.')
-            self._delayed_proj = False
+            self._do_delayed_proj = False
 
         if all(p['active'] for p in self.info['projs']):
             logger.info('Projections have already been applied. '
@@ -150,31 +166,19 @@ class ProjMixin(object):
             logger.info('The projections don\'t apply to these data.'
                         ' Doing nothing.')
             return self
-
         self._projector, self.info = _projector, info
-        # handle different data / preload attrs and create reference
-        # this also helps avoiding circular imports
-        for attr in ('get_data', '_data', 'data'):
-            data = getattr(self, attr, None)
-            if data is None:
-                continue
-            elif callable(data):
-                if self.preload:
-                    data = np.empty_like(self._data)
-                    for ii, e in enumerate(self._data):
-                        data[ii] = self._preprocess(np.dot(self._projector, e),
-                                                    self.verbose)
-                else:  # get data knows what to do.
-                    data = data()
+        if isinstance(self, _BaseRaw):
+            if self.preload:
+                self._data = np.dot(self._projector, self._data)
+        elif isinstance(self, _BaseEpochs):
+            if self.preload:
+                for ii, e in enumerate(self._data):
+                    self._data[ii] = self._project_epoch(e)
             else:
-                data = np.dot(self._projector, data)
-            break
+                self.load_data()  # will automatically apply
+        else:  # Evoked
+            self.data = np.dot(self._projector, self.data)
         logger.info('SSP projectors applied...')
-        if hasattr(self, '_data'):
-            self._data = data
-        else:
-            self.data = data
-
         return self
 
     def del_proj(self, idx):
@@ -240,8 +244,7 @@ class ProjMixin(object):
                     if ch in self:
                         layout.append(find_layout(self.info, ch, exclude=[]))
                     else:
-                        err = 'Channel type %s is not found in info.' % ch
-                        warnings.warn(err)
+                        warn('Channel type %s is not found in info.' % ch)
             fig = plot_projs_topomap(self.info['projs'], layout, axes=axes)
         else:
             raise ValueError("Info is missing projs. Nothing to plot.")
@@ -249,10 +252,10 @@ class ProjMixin(object):
         return fig
 
 
-def _proj_equal(a, b):
+def _proj_equal(a, b, check_active=True):
     """ Test if two projectors are equal """
 
-    equal = (a['active'] == b['active'] and
+    equal = ((a['active'] == b['active'] or not check_active) and
              a['kind'] == b['kind'] and
              a['desc'] == b['desc'] and
              a['data']['col_names'] == b['data']['col_names'] and
@@ -293,10 +296,8 @@ def _read_proj(fid, node, verbose=None):
         global_nchan = int(tag.data)
 
     items = dir_tree_find(nodes[0], FIFF.FIFFB_PROJ_ITEM)
-    for i in range(len(items)):
-
+    for item in items:
         #   Find all desired tags in one item
-        item = items[i]
         tag = find_tag(fid, item, FIFF.FIFF_NCHAN)
         if tag is not None:
             nchan = int(tag.data)
@@ -350,6 +351,12 @@ def _read_proj(fid, node, verbose=None):
         else:
             active = False
 
+        tag = find_tag(fid, item, FIFF.FIFF_MNE_ICA_PCA_EXPLAINED_VAR)
+        if tag is not None:
+            explained_var = tag.data
+        else:
+            explained_var = None
+
         # handle the case when data is transposed for some reason
         if data.shape[0] == len(names) and data.shape[1] == nvec:
             data = data.T
@@ -361,7 +368,8 @@ def _read_proj(fid, node, verbose=None):
         #   Use exactly the same fields in data as in a named matrix
         one = Projection(kind=kind, active=active, desc=desc,
                          data=dict(nrow=nvec, ncol=nchan, row_names=None,
-                                   col_names=names, data=data))
+                                   col_names=names, data=data),
+                         explained_var=explained_var)
 
         projs.append(one)
 
@@ -392,6 +400,8 @@ def _write_proj(fid, projs):
     projs : dict
         The projection operator.
     """
+    if len(projs) == 0:
+        return
     start_block(fid, FIFF.FIFFB_PROJ)
 
     for proj in projs:
@@ -408,6 +418,9 @@ def _write_proj(fid, projs):
         write_int(fid, FIFF.FIFF_MNE_PROJ_ITEM_ACTIVE, proj['active'])
         write_float_matrix(fid, FIFF.FIFF_PROJ_ITEM_VECTORS,
                            proj['data']['data'])
+        if proj['explained_var'] is not None:
+            write_float(fid, FIFF.FIFF_MNE_ICA_PCA_EXPLAINED_VAR,
+                        proj['explained_var'])
         end_block(fid, FIFF.FIFFB_PROJ_ITEM)
 
     end_block(fid, FIFF.FIFFB_PROJ)
@@ -415,17 +428,16 @@ def _write_proj(fid, projs):
 
 ###############################################################################
 # Utils
-
-def make_projector(projs, ch_names, bads=[], include_active=True):
+def make_projector(projs, ch_names, bads=(), include_active=True):
     """Create an SSP operator from SSP projection vectors
 
     Parameters
     ----------
     projs : list
         List of projection vectors.
-    ch_names : list of strings
+    ch_names : list of str
         List of channels to include in the projection matrix.
-    bads : list of strings
+    bads : list of str
         Some bad channels to exclude. If bad channels were marked
         in the raw file when projs were calculated using mne-python,
         they should not need to be included here as they will
@@ -441,6 +453,17 @@ def make_projector(projs, ch_names, bads=[], include_active=True):
         How many items in the projector.
     U : array
         The orthogonal basis of the projection vectors (optional).
+    """
+    return _make_projector(projs, ch_names, bads, include_active)
+
+
+def _make_projector(projs, ch_names, bads=(), include_active=True,
+                    inplace=False):
+    """Helper to subselect projs based on ch_names and bads
+
+    Use inplace=True mode to modify ``projs`` inplace so that no
+    warning will be raised next time projectors are constructed with
+    the given inputs. If inplace=True, no meaningful data are returned.
     """
     nchan = len(ch_names)
     if nchan == 0:
@@ -483,21 +506,37 @@ def make_projector(projs, ch_names, bads=[], include_active=True):
                     vecsel.append(p['data']['col_names'].index(name))
 
             # If there is something to pick, pickit
+            nrow = p['data']['nrow']
+            this_vecs = vecs[:, nvec:nvec + nrow]
             if len(sel) > 0:
-                nrow = p['data']['nrow']
-                vecs[sel, nvec:nvec + nrow] = p['data']['data'][:, vecsel].T
+                this_vecs[sel] = p['data']['data'][:, vecsel].T
 
             # Rescale for better detection of small singular values
             for v in range(p['data']['nrow']):
-                psize = sqrt(np.sum(vecs[:, nvec + v] * vecs[:, nvec + v]))
+                psize = sqrt(np.sum(this_vecs[:, v] * this_vecs[:, v]))
                 if psize > 0:
-                    vecs[:, nvec + v] /= psize
+                    orig_n = p['data']['data'].shape[1]
+                    if len(vecsel) < 0.9 * orig_n and not inplace:
+                        warn('Projection vector "%s" has magnitude %0.2f '
+                             '(should be unity), applying projector with '
+                             '%s/%s of the original channels available may '
+                             'be dangerous, consider recomputing and adding '
+                             'projection vectors for channels that are '
+                             'eventually used. If this is intentional, '
+                             'consider using info.normalize_proj()'
+                             % (p['desc'], psize, len(vecsel), orig_n))
+                    this_vecs[:, v] /= psize
                     nonzero += 1
-
+            # If doing "inplace" mode, "fix" the projectors to only operate
+            # on this subset of channels.
+            if inplace:
+                p['data']['data'] = this_vecs[sel].T
+                p['data']['col_names'] = [p['data']['col_names'][ii]
+                                          for ii in vecsel]
             nvec += p['data']['nrow']
 
     #   Check whether all of the vectors are exactly zero
-    if nonzero == 0:
+    if nonzero == 0 or inplace:
         return default_return
 
     # Reorthogonalize the vectors
@@ -511,6 +550,18 @@ def make_projector(projs, ch_names, bads=[], include_active=True):
     proj = np.eye(nchan, nchan) - np.dot(U, U.T)
 
     return proj, nproj, U
+
+
+def _normalize_proj(info):
+    """Helper to normalize proj after subselection to avoid warnings
+
+    This is really only useful for tests, and might not be needed
+    eventually if we change or improve our handling of projectors
+    with picks.
+    """
+    # Here we do info.get b/c info can actually be a noise cov
+    _make_projector(info['projs'], info.get('ch_names', info.get('names')),
+                    info['bads'], include_active=True, inplace=True)
 
 
 def make_projector_info(info, include_active=True):
@@ -633,12 +684,15 @@ def make_eeg_average_ref_proj(info, activate=True, verbose=None):
     if n_eeg == 0:
         raise ValueError('Cannot create EEG average reference projector '
                          '(no EEG data found)')
-    vec = np.ones((1, n_eeg)) / n_eeg
+    vec = np.ones((1, n_eeg))
+    vec /= n_eeg
+    explained_var = None
     eeg_proj_data = dict(col_names=eeg_names, row_names=None,
                          data=vec, nrow=1, ncol=n_eeg)
     eeg_proj = Projection(active=activate, data=eeg_proj_data,
                           desc='Average EEG reference',
-                          kind=FIFF.FIFFV_MNE_PROJ_ITEM_EEG_AVREF)
+                          kind=FIFF.FIFFV_MNE_PROJ_ITEM_EEG_AVREF,
+                          explained_var=explained_var)
     return eeg_proj
 
 
@@ -665,8 +719,7 @@ def _needs_eeg_average_ref_proj(info):
 
 
 @verbose
-def setup_proj(info, add_eeg_ref=True, activate=True,
-               verbose=None):
+def setup_proj(info, add_eeg_ref=True, activate=True, verbose=None):
     """Set up projection for Raw and Epochs
 
     Parameters
@@ -689,7 +742,7 @@ def setup_proj(info, add_eeg_ref=True, activate=True,
         The modified measurement info (Warning: info is modified inplace).
     """
     # Add EEG ref reference proj if necessary
-    if _needs_eeg_average_ref_proj(info) and add_eeg_ref:
+    if add_eeg_ref and _needs_eeg_average_ref_proj(info):
         eeg_proj = make_eeg_average_ref_proj(info, activate=activate)
         info['projs'].append(eeg_proj)
 
@@ -711,11 +764,11 @@ def setup_proj(info, add_eeg_ref=True, activate=True,
     return projector, info
 
 
-def _uniquify_projs(projs):
+def _uniquify_projs(projs, check_active=True, sort=True):
     """Aux function"""
     final_projs = []
     for proj in projs:  # flatten
-        if not any(_proj_equal(p, proj) for p in final_projs):
+        if not any(_proj_equal(p, proj, check_active) for p in final_projs):
             final_projs.append(proj)
 
     my_count = count(len(final_projs))
@@ -729,4 +782,4 @@ def _uniquify_projs(projs):
             sort_idx = next(my_count)
         return (sort_idx, x['desc'])
 
-    return sorted(final_projs, key=sorter)
+    return sorted(final_projs, key=sorter) if sort else final_projs

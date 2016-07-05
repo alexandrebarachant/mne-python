@@ -70,8 +70,8 @@ class RtEpochs(_BaseEpochs):
 
             reject = dict(grad=4000e-13, # T / m (gradiometers)
                           mag=4e-12, # T (magnetometers)
-                          eeg=40e-6, # uV (EEG channels)
-                          eog=250e-6 # uV (EOG channels))
+                          eeg=40e-6, # V (EEG channels)
+                          eog=250e-6 # V (EOG channels))
 
     flat : dict | None
         Rejection parameters based on flatness of signal.
@@ -266,16 +266,13 @@ class RtEpochs(_BaseEpochs):
             current_time = time.time()
             if current_time > (self._last_time + self.isi_max):
                 logger.info('Time of %s seconds exceeded.' % self.isi_max)
-                raise StopIteration
+                return  # signal the end properly
             if len(self._epoch_queue) > self._current:
                 epoch = self._epoch_queue[self._current]
                 event_id = self._events[self._current][-1]
                 self._current += 1
                 self._last_time = current_time
-                if return_event_id:
-                    return epoch, event_id
-                else:
-                    return epoch
+                return (epoch, event_id) if return_event_id else epoch
             if self._started:
                 if first:
                     logger.info('Waiting for epoch %d' % (self._current + 1))
@@ -395,16 +392,11 @@ class RtEpochs(_BaseEpochs):
         # select the channels
         epoch = epoch[self.picks, :]
 
-        # handle offset
-        if self._offset is not None:
-            epoch += self._offset
+        # Detrend, baseline correct, decimate
+        epoch = self._detrend_offset_decim(epoch, verbose='ERROR')
 
         # apply SSP
-        if self.proj and self._projector is not None:
-            epoch = np.dot(self._projector, epoch)
-
-        # Detrend, baseline correct, decimate
-        epoch = self._preprocess(epoch, verbose='ERROR')
+        epoch = self._project_epoch(epoch)
 
         # Decide if this is a good epoch
         is_good, _ = self._is_good_epoch(epoch, verbose='ERROR')

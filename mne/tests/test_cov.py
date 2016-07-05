@@ -5,8 +5,9 @@
 
 import os.path as op
 
-from nose.tools import assert_true, assert_equal
-from numpy.testing import assert_array_almost_equal, assert_array_equal
+from nose.tools import assert_true
+from numpy.testing import (assert_array_almost_equal, assert_array_equal,
+                           assert_equal)
 from nose.tools import assert_raises
 import numpy as np
 from scipy import linalg
@@ -15,29 +16,20 @@ import itertools as itt
 
 from mne.cov import (regularize, whiten_evoked, _estimate_rank_meeg_cov,
                      _auto_low_rank_model, _apply_scaling_cov,
-                     _undo_scaling_cov)
+                     _undo_scaling_cov, prepare_noise_cov)
 
 from mne import (read_cov, write_cov, Epochs, merge_events,
-                 find_events, compute_raw_data_covariance,
+                 find_events, compute_raw_covariance,
                  compute_covariance, read_evokeds, compute_proj_raw,
                  pick_channels_cov, pick_channels, pick_types, pick_info,
                  make_ad_hoc_cov)
-from mne.io import Raw
-from mne.utils import _TempDir, slow_test, requires_module, run_tests_if_main
+from mne.io import read_raw_fif, RawArray
+from mne.tests.common import assert_naming, assert_snr
+from mne.utils import (_TempDir, slow_test, requires_sklearn_0_15,
+                       run_tests_if_main)
 from mne.io.proc_history import _get_sss_rank
 from mne.io.pick import channel_type, _picks_by_type
-from mne.fixes import partial
 
-_recent_sklearn_call = """
-required_version = '0.15'
-import sklearn
-version = LooseVersion(sklearn.__version__)
-if version < required_version:
-    raise ImportError
-"""
-
-requires_sklearn_0_15 = partial(requires_module, name='sklearn',
-                                call=_recent_sklearn_call)
 warnings.simplefilter('always')  # enable b/c these tests throw warnings
 
 base_dir = op.join(op.dirname(__file__), '..', 'io', 'tests', 'data')
@@ -48,6 +40,37 @@ raw_fname = op.join(base_dir, 'test_raw.fif')
 ave_fname = op.join(base_dir, 'test-ave.fif')
 erm_cov_fname = op.join(base_dir, 'test_erm-cov.fif')
 hp_fif_fname = op.join(base_dir, 'test_chpi_raw_sss.fif')
+
+
+def test_cov_mismatch():
+    """Test estimation with MEG<->Head mismatch"""
+    raw = read_raw_fif(raw_fname).crop(0, 5).load_data()
+    events = find_events(raw, stim_channel='STI 014')
+    raw.pick_channels(raw.ch_names[:5])
+    raw.add_proj([], remove_existing=True)
+    epochs = Epochs(raw, events, None, tmin=-0.2, tmax=0., preload=True)
+    for kind in ('shift', 'None'):
+        epochs_2 = epochs.copy()
+        # This should be fine
+        with warnings.catch_warnings(record=True) as w:
+            compute_covariance([epochs, epochs_2])
+            assert_equal(len(w), 0)
+            if kind == 'shift':
+                epochs_2.info['dev_head_t']['trans'][:3, 3] += 0.001
+            else:  # None
+                epochs_2.info['dev_head_t'] = None
+            assert_raises(ValueError, compute_covariance, [epochs, epochs_2])
+            assert_equal(len(w), 0)
+            compute_covariance([epochs, epochs_2], on_mismatch='ignore')
+            assert_equal(len(w), 0)
+            compute_covariance([epochs, epochs_2], on_mismatch='warn')
+            assert_raises(ValueError, compute_covariance, epochs,
+                          on_mismatch='x')
+        assert_true(any('transform mismatch' in str(ww.message) for ww in w))
+    # This should work
+    epochs.info['dev_head_t'] = None
+    epochs_2.info['dev_head_t'] = None
+    compute_covariance([epochs, epochs_2])
 
 
 def test_ad_hoc_cov():
@@ -63,8 +86,7 @@ def test_ad_hoc_cov():
 
 
 def test_io_cov():
-    """Test IO for noise covariance matrices
-    """
+    """Test IO for noise covariance matrices"""
     tempdir = _TempDir()
     cov = read_cov(cov_fname)
     cov['method'] = 'empirical'
@@ -100,47 +122,82 @@ def test_io_cov():
         cov_badname = op.join(tempdir, 'test-bad-name.fif.gz')
         write_cov(cov_badname, cov)
         read_cov(cov_badname)
-    assert_true(len(w) == 2)
+    assert_naming(w, 'test_cov.py', 2)
 
 
-def test_cov_estimation_on_raw_segment():
-    """Test estimation from raw on continuous recordings (typically empty room)
-    """
+def test_cov_estimation_on_raw():
+    """Test estimation from raw (typically empty room)"""
     tempdir = _TempDir()
-    raw = Raw(raw_fname, preload=False)
-    cov = compute_raw_data_covariance(raw)
+    raw = read_raw_fif(raw_fname, preload=True)
     cov_mne = read_cov(erm_cov_fname)
-    assert_true(cov_mne.ch_names == cov.ch_names)
-    assert_true(linalg.norm(cov.data - cov_mne.data, ord='fro') /
-                linalg.norm(cov.data, ord='fro') < 1e-4)
 
-    # test IO when computation done in Python
-    cov.save(op.join(tempdir, 'test-cov.fif'))  # test saving
-    cov_read = read_cov(op.join(tempdir, 'test-cov.fif'))
-    assert_true(cov_read.ch_names == cov.ch_names)
-    assert_true(cov_read.nfree == cov.nfree)
-    assert_array_almost_equal(cov.data, cov_read.data)
+    # The pure-string uses the more efficient numpy-based method, the
+    # the list gets triaged to compute_covariance (should be equivalent
+    # but use more memory)
+    for method in ('empirical', ['empirical']):
+        cov = compute_raw_covariance(raw, tstep=None, method=method)
+        assert_equal(cov.ch_names, cov_mne.ch_names)
+        assert_equal(cov.nfree, cov_mne.nfree)
+        assert_snr(cov.data, cov_mne.data, 1e4)
 
-    # test with a subset of channels
-    picks = pick_channels(raw.ch_names, include=raw.ch_names[:5])
-    cov = compute_raw_data_covariance(raw, picks=picks)
-    assert_true(cov_mne.ch_names[:5] == cov.ch_names)
-    assert_true(linalg.norm(cov.data - cov_mne.data[picks][:, picks],
-                ord='fro') / linalg.norm(cov.data, ord='fro') < 1e-4)
-    # make sure we get a warning with too short a segment
-    raw_2 = raw.crop(0, 1)
-    with warnings.catch_warnings(record=True) as w:
+        cov = compute_raw_covariance(raw, method=method)  # tstep=0.2 (default)
+        assert_equal(cov.nfree, cov_mne.nfree - 119)  # cutoff some samples
+        assert_snr(cov.data, cov_mne.data, 1e2)
+
+        # test IO when computation done in Python
+        cov.save(op.join(tempdir, 'test-cov.fif'))  # test saving
+        cov_read = read_cov(op.join(tempdir, 'test-cov.fif'))
+        assert_true(cov_read.ch_names == cov.ch_names)
+        assert_true(cov_read.nfree == cov.nfree)
+        assert_array_almost_equal(cov.data, cov_read.data)
+
+        # test with a subset of channels
+        picks = pick_channels(raw.ch_names, include=raw.ch_names[:5])
+        raw_pick = raw.copy().pick_channels(
+            [raw.ch_names[pick] for pick in picks])
+        raw_pick.info.normalize_proj()
+        cov = compute_raw_covariance(raw_pick, picks=picks, tstep=None,
+                                     method=method)
+        assert_true(cov_mne.ch_names[:5] == cov.ch_names)
+        assert_snr(cov.data, cov_mne.data[picks][:, picks], 1e4)
+        cov = compute_raw_covariance(raw_pick, picks=picks, method=method)
+        assert_snr(cov.data, cov_mne.data[picks][:, picks], 90)  # cutoff samps
+        # make sure we get a warning with too short a segment
+        raw_2 = read_raw_fif(raw_fname).crop(0, 1, copy=False)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            cov = compute_raw_covariance(raw_2, method=method)
+        assert_true(any('Too few samples' in str(ww.message) for ww in w))
+        # no epochs found due to rejection
+        assert_raises(ValueError, compute_raw_covariance, raw, tstep=None,
+                      method='empirical', reject=dict(eog=200e-6))
+        # but this should work
+        cov = compute_raw_covariance(raw.copy().crop(0, 10., copy=False),
+                                     tstep=None, method=method,
+                                     reject=dict(eog=1000e-6))
+
+
+@slow_test
+@requires_sklearn_0_15
+def test_cov_estimation_on_raw_reg():
+    """Test estimation from raw with regularization"""
+    raw = read_raw_fif(raw_fname, preload=True)
+    raw.info['sfreq'] /= 10.
+    raw = RawArray(raw._data[:, ::10].copy(), raw.info)  # decimate for speed
+    cov_mne = read_cov(erm_cov_fname)
+    with warnings.catch_warnings(record=True):  # too few samples
         warnings.simplefilter('always')
-        cov = compute_raw_data_covariance(raw_2)
-    assert_true(len(w) == 1)
+        # XXX don't use "shrunk" here, for some reason it makes Travis 2.7
+        # hang... "diagonal_fixed" is much faster. Use long epochs for speed.
+        cov = compute_raw_covariance(raw, tstep=5., method='diagonal_fixed')
+    assert_snr(cov.data, cov_mne.data, 5)
 
 
 @slow_test
 def test_cov_estimation_with_triggers():
-    """Test estimation from raw with triggers
-    """
+    """Test estimation from raw with triggers"""
     tempdir = _TempDir()
-    raw = Raw(raw_fname, preload=False)
+    raw = read_raw_fif(raw_fname, preload=False)
     events = find_events(raw, stim_channel='STI 014')
     event_ids = [1, 2, 3, 4]
     reject = dict(grad=10000e-13, mag=4e-12, eeg=80e-6, eog=150e-6)
@@ -216,8 +273,7 @@ def test_cov_estimation_with_triggers():
 
 
 def test_arithmetic_cov():
-    """Test arithmetic with noise covariance matrices
-    """
+    """Test arithmetic with noise covariance matrices"""
     cov = read_cov(cov_fname)
     cov_sum = cov + cov
     assert_array_almost_equal(2 * cov.nfree, cov_sum.nfree)
@@ -231,9 +287,8 @@ def test_arithmetic_cov():
 
 
 def test_regularize_cov():
-    """Test cov regularization
-    """
-    raw = Raw(raw_fname, preload=False)
+    """Test cov regularization"""
+    raw = read_raw_fif(raw_fname, preload=False)
     raw.info['bads'].append(raw.ch_names[0])  # test with bad channels
     noise_cov = read_cov(cov_fname)
     # Regularize noise cov
@@ -269,17 +324,28 @@ def test_evoked_whiten():
 @slow_test
 def test_rank():
     """Test cov rank estimation"""
-    raw_sample = Raw(raw_fname)
+    # Test that our rank estimation works properly on a simple case
+    evoked = read_evokeds(ave_fname, condition=0, baseline=(None, 0),
+                          proj=False)
+    cov = read_cov(cov_fname)
+    ch_names = [ch for ch in evoked.info['ch_names'] if '053' not in ch and
+                ch.startswith('EEG')]
+    cov = prepare_noise_cov(cov, evoked.info, ch_names, None)
+    assert_equal(cov['eig'][0], 0.)  # avg projector should set this to zero
+    assert_true((cov['eig'][1:] > 0).all())  # all else should be > 0
 
-    raw_sss = Raw(hp_fif_fname)
+    # Now do some more comprehensive tests
+    raw_sample = read_raw_fif(raw_fname)
+
+    raw_sss = read_raw_fif(hp_fif_fname)
     raw_sss.add_proj(compute_proj_raw(raw_sss))
 
-    cov_sample = compute_raw_data_covariance(raw_sample)
-    cov_sample_proj = compute_raw_data_covariance(
+    cov_sample = compute_raw_covariance(raw_sample)
+    cov_sample_proj = compute_raw_covariance(
         raw_sample.copy().apply_proj())
 
-    cov_sss = compute_raw_data_covariance(raw_sss)
-    cov_sss_proj = compute_raw_data_covariance(
+    cov_sss = compute_raw_covariance(raw_sss)
+    cov_sss_proj = compute_raw_covariance(
         raw_sss.copy().apply_proj())
 
     picks_all_sample = pick_types(raw_sample.info, meg=True, eeg=True)
@@ -427,20 +493,22 @@ def test_auto_low_rank():
 def test_compute_covariance_auto_reg():
     """Test automated regularization"""
 
-    raw = Raw(raw_fname, preload=False)
+    raw = read_raw_fif(raw_fname, preload=True)
+    raw.resample(100, npad='auto')  # much faster estimation
     events = find_events(raw, stim_channel='STI 014')
     event_ids = [1, 2, 3, 4]
     reject = dict(mag=4e-12)
 
     # cov with merged events and keep_sample_mean=True
     events_merged = merge_events(events, event_ids, 1234)
-    picks = pick_types(raw.info, meg='mag', eeg=False)
+    # we need a few channels for numerical reasons in PCA/FA
+    picks = pick_types(raw.info, meg='mag', eeg=False)[:10]
+    raw.pick_channels([raw.ch_names[pick] for pick in picks])
+    raw.info.normalize_proj()
     epochs = Epochs(
         raw, events_merged, 1234, tmin=-0.2, tmax=0,
-        picks=picks[:10],  # we need a few channels for numerical reasons
-        # in PCA/FA.
         baseline=(-0.2, -0.1), proj=True, reject=reject, preload=True)
-    epochs.crop(None, 0)[:10]
+    epochs = epochs.crop(None, 0)[:10]
 
     method_params = dict(factor_analysis=dict(iter_n_components=[3]),
                          pca=dict(iter_n_components=[3]))

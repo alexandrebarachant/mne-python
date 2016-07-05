@@ -11,7 +11,7 @@ from .mixin import TransformerMixin
 from .. import pick_types
 from ..filter import (low_pass_filter, high_pass_filter, band_pass_filter,
                       band_stop_filter)
-from ..time_frequency import multitaper_psd
+from ..time_frequency.psd import _psd_multitaper
 from ..externals import six
 from ..utils import _check_type_picks
 
@@ -33,9 +33,9 @@ class Scaler(TransformerMixin):
     ----------
     info : instance of Info
         The measurement info
-    ch_mean_ : dict
+    ``ch_mean_`` : dict
         The mean value for each channel type
-    std_ : dict
+    ``std_`` : dict
         The standard deviation for each channel type
      """
     def __init__(self, info, with_mean=True, with_std=True):
@@ -71,8 +71,8 @@ class Scaler(TransformerMixin):
                                        exclude='bads')
         picks_list['grad'] = pick_types(self.info, meg='grad', ref_meg=False,
                                         exclude='bads')
-        picks_list['eeg'] = pick_types(self.info, eeg='grad', ref_meg=False,
-                                       exclude='bads')
+        picks_list['eeg'] = pick_types(self.info, eeg=True, ref_meg=False,
+                                       meg=False, exclude='bads')
 
         self.picks_list_ = picks_list
 
@@ -147,8 +147,8 @@ class Scaler(TransformerMixin):
         return X
 
 
-class ConcatenateChannels(TransformerMixin):
-    """Concatenates data from different channels into a single feature vector
+class EpochsVectorizer(TransformerMixin):
+    """EpochsVectorizer transforms epoch data to fit into a scikit-learn pipeline.
 
     Parameters
     ----------
@@ -157,8 +157,6 @@ class ConcatenateChannels(TransformerMixin):
 
     Attributes
     ----------
-    n_epochs : int
-        The number of epochs.
     n_channels : int
         The number of channels.
     n_times : int
@@ -167,12 +165,12 @@ class ConcatenateChannels(TransformerMixin):
     """
     def __init__(self, info=None):
         self.info = info
-        self.n_epochs = None
         self.n_channels = None
         self.n_times = None
 
     def fit(self, epochs_data, y):
-        """Concatenate different channels into a single feature vector
+        """For each epoch, concatenate data from different channels into a single
+        feature vector.
 
         Parameters
         ----------
@@ -183,7 +181,7 @@ class ConcatenateChannels(TransformerMixin):
 
         Returns
         -------
-        self : instance of ConcatenateChannels
+        self : instance of EpochsVectorizer
             returns the modified instance
         """
         if not isinstance(epochs_data, np.ndarray):
@@ -193,8 +191,8 @@ class ConcatenateChannels(TransformerMixin):
         return self
 
     def transform(self, epochs_data, y=None):
-        """Concatenates data from different channels into a single feature
-        vector
+        """For each epoch, concatenate data from different channels into a single
+        feature vector.
 
         Parameters
         ----------
@@ -225,7 +223,7 @@ class ConcatenateChannels(TransformerMixin):
         return X
 
     def inverse_transform(self, X, y=None):
-        """Reshape a feature vector into the original data shape
+        """For each epoch, reshape a feature vector into the original data shape
 
         Parameters
         ----------
@@ -244,7 +242,7 @@ class ConcatenateChannels(TransformerMixin):
             raise ValueError("epochs_data should be of type ndarray (got %s)."
                              % type(X))
 
-        return X.reshape(self.n_epochs, self.n_channels, self.n_times)
+        return X.reshape(-1, self.n_channels, self.n_times)
 
 
 class PSDEstimator(TransformerMixin):
@@ -274,6 +272,10 @@ class PSDEstimator(TransformerMixin):
         the signal (as in nitime).
     verbose : bool, str, int, or None
         If not None, override default verbose level (see mne.verbose).
+
+    See Also
+    --------
+    psd_multitaper
     """
     def __init__(self, sfreq=2 * np.pi, fmin=0, fmax=np.inf, bandwidth=None,
                  adaptive=False, low_bias=True, n_jobs=1,
@@ -302,7 +304,6 @@ class PSDEstimator(TransformerMixin):
         -------
         self : instance of PSDEstimator
             returns the modified instance
-
         """
         if not isinstance(epochs_data, np.ndarray):
             raise ValueError("epochs_data should be of type ndarray (got %s)."
@@ -330,22 +331,11 @@ class PSDEstimator(TransformerMixin):
         if not isinstance(epochs_data, np.ndarray):
             raise ValueError("epochs_data should be of type ndarray (got %s)."
                              % type(epochs_data))
-
-        epochs_data = np.atleast_3d(epochs_data)
-
-        n_epochs, n_channels, n_times = epochs_data.shape
-        X = epochs_data.reshape(n_epochs * n_channels, n_times)
-
-        psd, _ = multitaper_psd(x=X, sfreq=self.sfreq, fmin=self.fmin,
-                                fmax=self.fmax, bandwidth=self.bandwidth,
-                                adaptive=self.adaptive, low_bias=self.low_bias,
-                                n_jobs=self.n_jobs,
-                                normalization=self.normalization,
-                                verbose=self.verbose)
-
-        _, n_freqs = psd.shape
-        psd = psd.reshape(n_epochs, n_channels, n_freqs)
-
+        psd, _ = _psd_multitaper(
+            epochs_data, sfreq=self.sfreq, fmin=self.fmin, fmax=self.fmax,
+            bandwidth=self.bandwidth, adaptive=self.adaptive,
+            low_bias=self.low_bias, normalization=self.normalization,
+            n_jobs=self.n_jobs)
         return psd
 
 

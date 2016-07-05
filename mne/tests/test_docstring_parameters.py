@@ -1,12 +1,17 @@
-# TODO inspect for Cython (see sagenb.misc.sageinspect)
 from __future__ import print_function
 
-from nose.plugins.skip import SkipTest
-from os import path as op
+from nose.tools import assert_true
+import sys
 import inspect
 import warnings
-import imp
-from mne.utils import run_tests_if_main
+
+from pkgutil import walk_packages
+from inspect import getsource
+
+import mne
+from mne.utils import (run_tests_if_main, _doc_special_members,
+                       requires_numpydoc)
+from mne.fixes import _get_args
 
 public_modules = [
     # the list of modules users need to access for all functionality
@@ -35,13 +40,6 @@ public_modules = [
     'mne.viz',
 ]
 
-docscrape_path = op.join(op.dirname(__file__), '..', '..', 'doc', 'sphinxext',
-                         'numpy_ext', 'docscrape.py')
-if op.isfile(docscrape_path):
-    docscrape = imp.load_source('docscrape', docscrape_path)
-else:
-    docscrape = None
-
 
 def get_name(func):
     parts = []
@@ -54,26 +52,28 @@ def get_name(func):
     return '.'.join(parts)
 
 
-# functions to ignore # of args b/c we deprecated a name and moved it
-# to the end
-_deprecation_ignores = [
+# functions to ignore args / docstring of
+_docstring_ignores = [
     'mne.io.write',  # always ignore these
     'mne.fixes._in1d',  # fix function
-    'mne.utils.plot_epochs_trellis',  # deprecated
-    'mne.utils.write_bem_surface',  # deprecated
-    'mne.gui.coregistration'  # deprecated
+    'mne.epochs.average_movements',  # deprecated pos param
+]
+
+_tab_ignores = [
+    'mne.channels.tests.test_montage',  # demo data has a tab
 ]
 
 
 def check_parameters_match(func, doc=None):
     """Helper to check docstring, returns list of incorrect results"""
+    from numpydoc import docscrape
     incorrect = []
     name_ = get_name(func)
     if not name_.startswith('mne.') or name_.startswith('mne.externals'):
         return incorrect
     if inspect.isdatadescriptor(func):
         return incorrect
-    args, varargs, varkw, defaults = inspect.getargspec(func)
+    args = _get_args(func)
     # drop self
     if len(args) > 0 and args[0] == 'self':
         args = args[1:]
@@ -91,7 +91,8 @@ def check_parameters_match(func, doc=None):
     if len(param_names) != len(args):
         bad = str(sorted(list(set(param_names) - set(args)) +
                          list(set(args) - set(param_names))))
-        if not any(d in name_ for d in _deprecation_ignores):
+        if not any(d in name_ for d in _docstring_ignores) and \
+                'deprecation_wrapped' not in func.__code__.co_name:
             incorrect += [name_ + ' arg mismatch: ' + bad]
     else:
         for n1, n2 in zip(param_names, args):
@@ -100,10 +101,10 @@ def check_parameters_match(func, doc=None):
     return incorrect
 
 
+@requires_numpydoc
 def test_docstring_parameters():
     """Test module docsting formatting"""
-    if docscrape is None:
-        raise SkipTest('This must be run from the mne-python source directory')
+    from numpydoc import docscrape
     incorrect = []
     for name in public_modules:
         module = __import__(name, globals())
@@ -111,7 +112,7 @@ def test_docstring_parameters():
             module = getattr(module, submod)
         classes = inspect.getmembers(module, inspect.isclass)
         for cname, cls in classes:
-            if cname.startswith('_'):
+            if cname.startswith('_') and cname not in _doc_special_members:
                 continue
             with warnings.catch_warnings(record=True) as w:
                 cdoc = docscrape.ClassDoc(cls)
@@ -133,6 +134,19 @@ def test_docstring_parameters():
     msg = '\n' + '\n'.join(sorted(list(set(incorrect))))
     if len(incorrect) > 0:
         raise AssertionError(msg)
+
+
+def test_tabs():
+    """Test that there are no tabs in our source files"""
+    for importer, modname, ispkg in walk_packages(mne.__path__, prefix='mne.'):
+        if not ispkg and modname not in _tab_ignores:
+            # mod = importlib.import_module(modname)  # not py26 compatible!
+            __import__(modname)  # because we don't import e.g. mne.tests w/mne
+            mod = sys.modules[modname]
+            source = getsource(mod)
+            assert_true('\t' not in source,
+                        '"%s" has tabs, please remove them or add it to the'
+                        'ignore list' % modname)
 
 
 run_tests_if_main()

@@ -1,6 +1,7 @@
 # Authors: Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
 #          Matti Hamalainen <msh@nmr.mgh.harvard.edu>
 #          Eric Larson <larson.eric.d@gmail.com>
+#          Lorenzo De Santis <lorenzo.de-santis@u-psud.fr>
 #
 # License: BSD (3-clause)
 
@@ -8,12 +9,15 @@ import sys
 import os
 import os.path as op
 import shutil
+import glob
+
 import numpy as np
 from scipy import linalg
 
 from .fixes import partial
-from .utils import (verbose, logger, run_subprocess, deprecated,
-                    get_subjects_dir)
+from .utils import verbose, logger, run_subprocess, get_subjects_dir, warn
+from .transforms import _ensure_trans, apply_trans
+from .io import Info
 from .io.constants import FIFF
 from .io.write import (start_file, start_block, write_float, write_int,
                        write_float_matrix, write_int_matrix, end_block,
@@ -36,6 +40,30 @@ from .externals.six import string_types
 # integral equation using analytically integrated elements",
 # IEEE Trans Biomed Eng. 1992 39(9) : 986 - 990
 #
+
+
+class ConductorModel(dict):
+    """BEM or sphere model"""
+    def __repr__(self):
+        if self['is_sphere']:
+            center = ', '.join('%0.1f' % (x * 1000.) for x in self['r0'])
+            pl = '' if len(self['layers']) == 1 else 's'
+            rad = self.radius
+            if rad is None:  # no radius / MEG only
+                extra = 'Sphere (no layers): r0=[%s] mm' % center
+            else:
+                extra = ('Sphere (%s layer%s): r0=[%s] R=%1.f mm'
+                         % (len(self['layers']) - 1, pl, center, rad * 1000.))
+        else:
+            pl = '' if len(self['surfs']) == 1 else 's'
+            extra = ('BEM (%s layer%s)' % (len(self['surfs']), pl))
+        return '<ConductorModel  |  %s>' % extra
+
+    @property
+    def radius(self):
+        if not self['is_sphere']:
+            raise RuntimeError('radius undefined for BEM')
+        return None if len(self['layers']) == 0 else self['layers'][-1]['rad']
 
 
 def _calc_beta(rk, rk_norm, rk1, rk1_norm):
@@ -256,13 +284,13 @@ def make_bem_solution(surfs, verbose=None):
     Parameters
     ----------
     surfs : list of dict
-        The BEM surfaces to use.
+        The BEM surfaces to use (`from make_bem_model`)
     verbose : bool, str, int, or None
         If not None, override default verbose level (see mne.verbose).
 
     Returns
     -------
-    bem : dict
+    bem : instance of ConductorModel
         The BEM solution.
 
     Notes
@@ -282,7 +310,7 @@ def make_bem_solution(surfs, verbose=None):
         # Load the surfaces
         logger.info('Loading surfaces...')
         surfs = read_bem_surfaces(surfs)
-    bem = dict(surfs=surfs)
+    bem = ConductorModel(is_sphere=False, surfs=surfs)
     _add_gamma_multipliers(bem)
     if len(bem['surfs']) == 3:
         logger.info('Three-layer model surfaces loaded.')
@@ -290,6 +318,7 @@ def make_bem_solution(surfs, verbose=None):
         logger.info('Homogeneous model surface loaded.')
     else:
         raise RuntimeError('Only 1- or 3-layer BEM computations supported')
+    _check_bem_size(bem['surfs'])
     _fwd_bem_linear_collocation_solution(bem)
     logger.info('BEM geometry computations complete.')
     return bem
@@ -471,12 +500,17 @@ def make_bem_model(subject, ico=4, conductivity=(0.3, 0.006, 0.3),
                    subjects_dir=None, verbose=None):
     """Create a BEM model for a subject
 
+    .. note:: To get a single layer bem corresponding to the --homog flag in
+              the command line tool set the ``conductivity`` parameter
+              to a list/tuple with a single value (e.g. [0.3]).
+
     Parameters
     ----------
     subject : str
         The subject.
     ico : int | None
         The surface ico downsampling to use, e.g. 5=20484, 4=5120, 3=1280.
+        If None, no subsampling is applied.
     conductivity : array of int, shape (3,) or (1,)
         The conductivities to use for each shell. Should be a single element
         for a one-layer model, or three elements for a three-layer model.
@@ -490,7 +524,8 @@ def make_bem_model(subject, ico=4, conductivity=(0.3, 0.006, 0.3),
     Returns
     -------
     surfaces : list of dict
-        The BEM surfaces.
+        The BEM surfaces. Use `make_bem_solution` to turn these into a
+        `ConductorModel` suitable for forward calculation.
 
     Notes
     -----
@@ -522,6 +557,7 @@ def make_bem_model(subject, ico=4, conductivity=(0.3, 0.006, 0.3),
         surfaces = surfaces[:1]
         ids = ids[:1]
     surfaces = _surfaces_to_bem(surfaces, ids, conductivity, ico)
+    _check_bem_size(surfaces)
     logger.info('Complete.\n')
     return surfaces
 
@@ -673,7 +709,7 @@ def make_sphere_model(r0=(0., 0., 0.04), head_radius=0.09, info=None,
         If float, compute spherical shells for EEG using the given radius.
         If 'auto', estimate an approriate radius from the dig points in Info,
         If None, exclude shells.
-    info : instance of mne.io.meas_info.Info | None
+    info : instance of Info | None
         Measurement info. Only needed if ``r0`` or ``head_radius`` are
         ``'auto'``.
     relative_radii : array-like
@@ -685,8 +721,8 @@ def make_sphere_model(r0=(0., 0., 0.04), head_radius=0.09, info=None,
 
     Returns
     -------
-    sphere : dict
-        A spherical BEM.
+    sphere : instance of ConductorModel
+        The resulting spherical conductor model.
 
     Notes
     -----
@@ -703,18 +739,26 @@ def make_sphere_model(r0=(0., 0., 0.04), head_radius=0.09, info=None,
             if param != 'auto':
                 raise ValueError('%s, if str, must be "auto" not "%s"'
                                  % (name, param))
-
+    relative_radii = np.array(relative_radii, float).ravel()
+    sigmas = np.array(sigmas, float).ravel()
+    if len(relative_radii) != len(sigmas):
+        raise ValueError('relative_radii length (%s) must match that of '
+                         'sigmas (%s)' % (len(relative_radii),
+                                          len(sigmas)))
+    if len(sigmas) == 0 and head_radius is not None:
+            raise ValueError('sigmas must be supplied if head_radius is not '
+                             'None')
     if (isinstance(r0, string_types) and r0 == 'auto') or \
        (isinstance(head_radius, string_types) and head_radius == 'auto'):
         if info is None:
             raise ValueError('Info must not be None for auto mode')
-        head_radius_fit, r0_fit = fit_sphere_to_headshape(info)[:2]
+        head_radius_fit, r0_fit = fit_sphere_to_headshape(info, units='m')[:2]
         if isinstance(r0, string_types):
-            r0 = r0_fit / 1000.
+            r0 = r0_fit
         if isinstance(head_radius, string_types):
-            head_radius = head_radius_fit / 1000.
-    sphere = dict(r0=np.array(r0), is_sphere=True,
-                  coord_frame=FIFF.FIFFV_COORD_HEAD)
+            head_radius = head_radius_fit
+    sphere = ConductorModel(is_sphere=True, r0=np.array(r0),
+                            coord_frame=FIFF.FIFFV_COORD_HEAD)
     sphere['layers'] = list()
     if head_radius is not None:
         # Eventually these could be configurable...
@@ -723,17 +767,16 @@ def make_sphere_model(r0=(0., 0., 0.04), head_radius=0.09, info=None,
         order = np.argsort(relative_radii)
         relative_radii = relative_radii[order]
         sigmas = sigmas[order]
-        layers = sphere['layers']
         for rel_rad, sig in zip(relative_radii, sigmas):
             # sort layers by (relative) radius, and scale radii
             layer = dict(rad=rel_rad, sigma=sig)
             layer['rel_rad'] = layer['rad'] = rel_rad
-            layers.append(layer)
+            sphere['layers'].append(layer)
 
         # scale the radii
-        R = layers[-1]['rad']
-        rR = layers[-1]['rel_rad']
-        for layer in layers:
+        R = sphere['layers'][-1]['rad']
+        rR = sphere['layers'][-1]['rel_rad']
+        for layer in sphere['layers']:
             layer['rad'] /= R
             layer['rel_rad'] /= rR
 
@@ -743,13 +786,15 @@ def make_sphere_model(r0=(0., 0., 0.04), head_radius=0.09, info=None,
 
         # Scale the relative radii
         for k in range(len(relative_radii)):
-            layers[k]['rad'] = (head_radius * layers[k]['rel_rad'])
+            sphere['layers'][k]['rad'] = (head_radius *
+                                          sphere['layers'][k]['rel_rad'])
         rv = _fwd_eeg_fit_berg_scherg(sphere, 200, 3)
         logger.info('\nEquiv. model fitting -> RV = %g %%' % (100 * rv))
         for k in range(3):
             logger.info('mu%d = %g    lambda%d = %g'
                         % (k + 1, sphere['mu'][k], k + 1,
-                           layers[-1]['sigma'] * sphere['lambda'][k]))
+                           sphere['layers'][-1]['sigma'] *
+                           sphere['lambda'][k]))
         logger.info('Set up EEG sphere model with scalp radius %7.1f mm\n'
                     % (1000 * head_radius,))
     return sphere
@@ -758,24 +803,33 @@ def make_sphere_model(r0=(0., 0., 0.04), head_radius=0.09, info=None,
 # #############################################################################
 # Helpers
 
+_dig_kind_dict = {
+    'cardinal': FIFF.FIFFV_POINT_CARDINAL,
+    'hpi': FIFF.FIFFV_POINT_HPI,
+    'eeg': FIFF.FIFFV_POINT_EEG,
+    'extra': FIFF.FIFFV_POINT_EXTRA,
+}
+_dig_kind_rev = dict((val, key) for key, val in _dig_kind_dict.items())
+_dig_kind_ints = tuple(_dig_kind_dict.values())
+
+
 @verbose
-def fit_sphere_to_headshape(info, dig_kinds=(FIFF.FIFFV_POINT_EXTRA,),
-                            verbose=None):
+def fit_sphere_to_headshape(info, dig_kinds='auto', units='m', verbose=None):
     """Fit a sphere to the headshape points to determine head center
 
     Parameters
     ----------
-    info : instance of mne.io.meas_info.Info
+    info : instance of Info
         Measurement info.
-    dig_kinds : tuple of int
-        Kind of digitization points to use in the fitting. These can be
-        any kind defined in io.constants.FIFF:
-            FIFFV_POINT_CARDINAL
-            FIFFV_POINT_HPI
-            FIFFV_POINT_EEG
-            FIFFV_POINT_ECG
-            FIFFV_POINT_EXTRA
-        Defaults to (FIFFV_POINT_EXTRA,).
+    dig_kinds : list of str | str
+        Kind of digitization points to use in the fitting. These can be any
+        combination of ('cardinal', 'hpi', 'eeg', 'extra'). Can also
+        be 'auto' (default), which will use only the 'extra' points if
+        enough are available, and if not, uses 'extra' and 'eeg' points.
+    units : str
+        Can be "m" (default) or "mm".
+
+        .. versionadded:: 0.12
 
     verbose : bool, str, int, or None
         If not None, override default verbose level (see mne.verbose).
@@ -783,68 +837,143 @@ def fit_sphere_to_headshape(info, dig_kinds=(FIFF.FIFFV_POINT_EXTRA,),
     Returns
     -------
     radius : float
-        Sphere radius in mm.
+        Sphere radius.
     origin_head: ndarray, shape (3,)
-        Head center in head coordinates (mm).
+        Head center in head coordinates.
     origin_device: ndarray, shape (3,)
-        Head center in device coordinates (mm).
+        Head center in device coordinates.
+
+    Notes
+    -----
+    This function excludes any points that are low and frontal
+    (``z < 0 and y > 0``) to improve the fit.
     """
-    # get head digization points of the specified kind
+    if not isinstance(units, string_types) or units not in ('m', 'mm'):
+        raise ValueError('units must be a "m" or "mm"')
+    if not isinstance(info, Info):
+        raise TypeError('info must be an instance of Info not %s' % type(info))
+    if info['dig'] is None:
+        raise RuntimeError('Cannot fit headshape without digitization '
+                           ', info["dig"] is None')
+    if isinstance(dig_kinds, string_types):
+        if dig_kinds == 'auto':
+            # try "extra" first
+            try:
+                return fit_sphere_to_headshape(info, 'extra', units=units)
+            except ValueError:
+                pass
+            return fit_sphere_to_headshape(info, ('extra', 'eeg'), units=units)
+        else:
+            dig_kinds = (dig_kinds,)
+    # convert string args to ints (first make dig_kinds mutable in case tuple)
+    dig_kinds = list(dig_kinds)
+    for di, d in enumerate(dig_kinds):
+        dig_kinds[di] = _dig_kind_dict.get(d, d)
+        if dig_kinds[di] not in _dig_kind_ints:
+            raise ValueError('dig_kinds[#%d] (%s) must be one of %s'
+                             % (di, d, sorted(list(_dig_kind_dict.keys()))))
+
+    # get head digization points of the specified kind(s)
     hsp = [p['r'] for p in info['dig'] if p['kind'] in dig_kinds]
+    if any(p['coord_frame'] != FIFF.FIFFV_COORD_HEAD for p in info['dig']):
+        raise RuntimeError('Digitization points not in head coordinates, '
+                           'contact mne-python developers')
 
     # exclude some frontal points (nose etc.)
     hsp = [p for p in hsp if not (p[2] < 0 and p[1] > 0)]
 
-    if len(hsp) == 0:
-        raise ValueError('No head digitization points of the specified '
-                         'kinds (%s) found.' % dig_kinds)
+    if len(hsp) <= 10:
+        kinds_str = ', '.join(['"%s"' % _dig_kind_rev[d]
+                               for d in sorted(dig_kinds)])
+        msg = ('Only %s head digitization points of the specified kind%s (%s,)'
+               % (len(hsp), 's' if len(dig_kinds) != 1 else '', kinds_str))
+        if len(hsp) < 4:
+            raise ValueError(msg + ', at least 4 required')
+        else:
+            warn(msg + ', fitting may be inaccurate')
 
-    hsp = 1e3 * np.array(hsp)
-
-    radius, origin_head = _fit_sphere(hsp, disp=False)
+    radius, origin_head = _fit_sphere(np.array(hsp), disp=False)
     # compute origin in device coordinates
-    trans = info['dev_head_t']
-    if trans['from'] != FIFF.FIFFV_COORD_DEVICE \
-            or trans['to'] != FIFF.FIFFV_COORD_HEAD:
-        raise RuntimeError('device to head transform not found')
-
-    head_to_dev = linalg.inv(trans['trans'])
-    origin_device = 1e3 * np.dot(head_to_dev,
-                                 np.r_[1e-3 * origin_head, 1.0])[:3]
+    head_to_dev = _ensure_trans(info['dev_head_t'], 'head', 'meg')
+    origin_device = apply_trans(head_to_dev, origin_head)
+    radius *= 1e3
+    origin_head *= 1e3
+    origin_device *= 1e3
 
     logger.info('Fitted sphere radius:'.ljust(30) + '%0.1f mm' % radius)
+    # 99th percentile on Wikipedia for Giabella to back of head is 21.7cm,
+    # i.e. 108mm "radius", so let's go with 110mm
+    # en.wikipedia.org/wiki/Human_head#/media/File:HeadAnthropometry.JPG
+    if radius > 110.:
+        warn('Estimated head size (%0.1f mm) exceeded 99th '
+             'percentile for adult head size' % (radius,))
+    # > 2 cm away from head center in X or Y is strange
+    if np.sqrt(np.sum(origin_head[:2] ** 2)) > 20:
+        warn('(X, Y) fit (%0.1f, %0.1f) more than 20 mm from '
+             'head frame origin' % tuple(origin_head[:2]))
     logger.info('Origin head coordinates:'.ljust(30) +
                 '%0.1f %0.1f %0.1f mm' % tuple(origin_head))
     logger.info('Origin device coordinates:'.ljust(30) +
                 '%0.1f %0.1f %0.1f mm' % tuple(origin_device))
+    if units == 'm':
+        radius /= 1e3
+        origin_head /= 1e3
+        origin_device /= 1e3
 
     return radius, origin_head, origin_device
 
 
 def _fit_sphere(points, disp='auto'):
-    """Aux function to fit points to a sphere"""
-    from scipy.optimize import fmin_powell
+    """Aux function to fit a sphere to an arbitrary set of points"""
+    from scipy.optimize import fmin_cobyla
     if isinstance(disp, string_types) and disp == 'auto':
         disp = True if logger.level <= 20 else False
     # initial guess for center and radius
-    xradius = (np.max(points[:, 0]) - np.min(points[:, 0])) / 2.
-    yradius = (np.max(points[:, 1]) - np.min(points[:, 1])) / 2.
-
-    radius_init = (xradius + yradius) / 2.
-    center_init = np.array([0.0, 0.0, np.max(points[:, 2]) - radius_init])
+    radii = (np.max(points, axis=1) - np.min(points, axis=1)) / 2.
+    radius_init = radii.mean()
+    center_init = np.median(points, axis=0)
 
     # optimization
-    x0 = np.r_[center_init, radius_init]
+    x0 = np.concatenate([center_init, [radius_init]])
 
-    def cost_fun(x, points):
-        return np.sum((np.sqrt(np.sum((points - x[:3]) ** 2, axis=1)) -
-                      x[3]) ** 2)
+    def cost_fun(center_rad):
+        d = points - center_rad[:3]
+        d = (np.sqrt(np.sum(d * d, axis=1)) - center_rad[3])
+        return np.sum(d * d)
 
-    x_opt = fmin_powell(cost_fun, x0, args=(points,), disp=disp)
+    def constraint(center_rad):
+        return center_rad[3]  # radius must be >= 0
+
+    x_opt = fmin_cobyla(cost_fun, x0, constraint, rhobeg=radius_init,
+                        rhoend=radius_init * 1e-6, disp=disp)
 
     origin = x_opt[:3]
     radius = x_opt[3]
     return radius, origin
+
+
+def _check_origin(origin, info, coord_frame='head', disp=False):
+    """Helper to check or auto-determine the origin"""
+    if isinstance(origin, string_types):
+        if origin != 'auto':
+            raise ValueError('origin must be a numerical array, or "auto", '
+                             'not %s' % (origin,))
+        if coord_frame == 'head':
+            R, origin = fit_sphere_to_headshape(info, verbose=False,
+                                                units='m')[:2]
+            logger.info('    Automatic origin fit: head of radius %0.1f mm'
+                        % (R * 1000.,))
+            del R
+        else:
+            origin = (0., 0., 0.)
+    origin = np.array(origin, float)
+    if origin.shape != (3,):
+        raise ValueError('origin must be a 3-element array')
+    if disp:
+        origin_str = ', '.join(['%0.1f' % (o * 1000) for o in origin])
+        logger.info('    Using origin %s mm in the %s frame'
+                    % (origin_str, coord_frame))
+    return origin
 
 
 # ############################################################################
@@ -853,7 +982,7 @@ def _fit_sphere(points, disp='auto'):
 @verbose
 def make_watershed_bem(subject, subjects_dir=None, overwrite=False,
                        volume='T1', atlas=False, gcaatlas=False, preflood=None,
-                       verbose=None):
+                       show=False, verbose=None):
     """
     Create BEM surfaces using the watershed algorithm included with FreeSurfer
 
@@ -874,32 +1003,31 @@ def make_watershed_bem(subject, subjects_dir=None, overwrite=False,
         Use the subcortical atlas
     preflood : int
         Change the preflood height
+    show : bool
+        Show surfaces to visually inspect all three BEM surfaces (recommended).
+
+        .. versionadded:: 0.12
+
     verbose : bool, str or None
         If not None, override default verbose level
 
+    Notes
+    -----
     .. versionadded:: 0.10
     """
-    from .surface import read_surface
-    env = os.environ.copy()
+    from .surface import read_surface, write_surface, _read_surface_geom
+    from .viz.misc import plot_bem
+    env, mri_dir = _prepare_env(subject, subjects_dir,
+                                requires_freesurfer=True,
+                                requires_mne=True)[:2]
 
-    if not os.environ.get('FREESURFER_HOME'):
-        raise RuntimeError('FREESURFER_HOME environment variable not set')
-
-    env['SUBJECT'] = subject
-
-    subjects_dir = get_subjects_dir(subjects_dir, raise_error=True)
-    env['SUBJECTS_DIR'] = subjects_dir
-
+    subjects_dir = env['SUBJECTS_DIR']
     subject_dir = op.join(subjects_dir, subject)
     mri_dir = op.join(subject_dir, 'mri')
     T1_dir = op.join(mri_dir, volume)
     T1_mgz = op.join(mri_dir, volume + '.mgz')
     bem_dir = op.join(subject_dir, 'bem')
     ws_dir = op.join(subject_dir, 'bem', 'watershed')
-
-    if not op.isdir(subject_dir):
-        raise RuntimeError('Could not find the MRI data directory "%s"'
-                           % subject_dir)
     if not op.isdir(bem_dir):
         os.makedirs(bem_dir)
     if not op.isdir(T1_dir) and not op.isfile(T1_mgz):
@@ -907,13 +1035,13 @@ def make_watershed_bem(subject, subjects_dir=None, overwrite=False,
     if op.isdir(ws_dir):
         if not overwrite:
             raise RuntimeError('%s already exists. Use the --overwrite option'
-                               'to recreate it.' % ws_dir)
+                               ' to recreate it.' % ws_dir)
         else:
             shutil.rmtree(ws_dir)
     # put together the command
     cmd = ['mri_watershed']
     if preflood:
-        cmd += ["-h",  "%s" % int(preflood)]
+        cmd += ["-h", "%s" % int(preflood)]
 
     if gcaatlas:
         cmd += ['-atlas', '-T1', '-brain_atlas', env['FREESURFER_HOME'] +
@@ -934,21 +1062,49 @@ def make_watershed_bem(subject, subjects_dir=None, overwrite=False,
                 'SUBJECT = %s\n'
                 'Results dir = %s\n' % (subjects_dir, subject, ws_dir))
     os.makedirs(op.join(ws_dir, 'ws'))
-    run_subprocess(cmd, env=env, stdout=sys.stdout)
-    #
-    os.chdir(ws_dir)
+    run_subprocess(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
+
     if op.isfile(T1_mgz):
-        # XXX : do this with python code
-        surfaces = [subject + '_brain_surface', subject +
-                    '_inner_skull_surface', subject + '_outer_skull_surface',
-                    subject + '_outer_skin_surface']
-        for s in surfaces:
-            cmd = ['mne_convert_surface', '--surf', s, '--mghmri', T1_mgz,
-                   '--surfout', s, "--replacegeom"]
-            run_subprocess(cmd, env=env, stdout=sys.stdout)
-    os.chdir(bem_dir)
-    if op.isfile(subject + '-head.fif'):
-        os.remove(subject + '-head.fif')
+        new_info = _extract_volume_info(T1_mgz)
+        if new_info is None:
+            warn('nibabel is required to replace the volume info. Volume info'
+                 'not updated in the written surface.')
+            new_info = dict()
+        surfs = ['brain', 'inner_skull', 'outer_skull', 'outer_skin']
+        for s in surfs:
+            surf_ws_out = op.join(ws_dir, '%s_%s_surface' % (subject, s))
+
+            surf, volume_info = _read_surface_geom(surf_ws_out,
+                                                   read_metadata=True)
+            volume_info.update(new_info)  # replace volume info, 'head' stays
+
+            write_surface(s, surf['rr'], surf['tris'], volume_info=volume_info)
+            # Create symbolic links
+            surf_out = op.join(bem_dir, '%s.surf' % s)
+            if not overwrite and op.exists(surf_out):
+                skip_symlink = True
+            else:
+                if op.exists(surf_out):
+                    os.remove(surf_out)
+                _symlink(surf_ws_out, surf_out)
+                skip_symlink = False
+
+        if skip_symlink:
+            logger.info("Unable to create all symbolic links to .surf files "
+                        "in bem folder. Use --overwrite option to recreate "
+                        "them.")
+            dest = op.join(bem_dir, 'watershed')
+        else:
+            logger.info("Symbolic links to .surf files created in bem folder")
+            dest = bem_dir
+
+    logger.info("\nThank you for waiting.\nThe BEM triangulations for this "
+                "subject are now available at:\n%s." % dest)
+
+    # Write a head file for coregistration
+    fname_head = op.join(bem_dir, subject + '-head.fif')
+    if op.isfile(fname_head):
+        os.remove(fname_head)
 
     # run the equivalent of mne_surf2bem
     points, tris = read_surface(op.join(ws_dir,
@@ -956,9 +1112,36 @@ def make_watershed_bem(subject, subjects_dir=None, overwrite=False,
     points *= 1e-3
     surf = dict(coord_frame=5, id=4, nn=None, np=len(points),
                 ntri=len(tris), rr=points, sigma=1, tris=tris)
-    write_bem_surfaces(subject + '-head.fif', surf)
+    write_bem_surfaces(fname_head, surf)
 
-    logger.info('Created %s/%s-head.fif\n\nComplete.' % (bem_dir, subject))
+    # Show computed BEM surfaces
+    if show:
+        plot_bem(subject=subject, subjects_dir=subjects_dir,
+                 orientation='coronal', slices=None, show=True)
+
+    logger.info('Created %s\n\nComplete.' % (fname_head,))
+
+
+def _extract_volume_info(mgz, raise_error=True):
+    """Helper for extracting volume info from a mgz file."""
+    try:
+        import nibabel as nib
+    except ImportError:
+        return  # warning raised elsewhere
+    header = nib.load(mgz).header
+    new_info = dict()
+    version = header['version']
+    if version == 1:
+        version = '%s  # volume info valid' % version
+    else:
+        raise ValueError('Volume info invalid.')
+    new_info['valid'] = version
+    new_info['filename'] = mgz
+    new_info['volume'] = header['dims'][:3]
+    new_info['voxelsize'] = header['delta']
+    new_info['xras'], new_info['yras'], new_info['zras'] = header['Mdc'].T
+    new_info['cras'] = header['Pxyz_c']
+    return new_info
 
 
 # ############################################################################
@@ -986,6 +1169,10 @@ def read_bem_surfaces(fname, patch_stats=False, s_id=None, verbose=None):
     surf: list | dict
         A list of dictionaries that each contain a surface. If s_id
         is not None, only the requested surface will be returned.
+
+    See Also
+    --------
+    write_bem_surfaces, write_bem_solution, make_bem_model
     """
     from .surface import _complete_surface_info
     # Default coordinate frame
@@ -1113,8 +1300,13 @@ def read_bem_solution(fname, verbose=None):
 
     Returns
     -------
-    bem : dict
+    bem : instance of ConductorModel
         The BEM solution.
+
+    See Also
+    --------
+    write_bem_solution, read_bem_surfaces, write_bem_surfaces,
+    make_bem_solution
     """
     # mirrors fwd_bem_load_surfaces from fwd_bem_model.c
     logger.info('Loading surfaces...')
@@ -1137,7 +1329,7 @@ def read_bem_solution(fname, verbose=None):
         logger.info('Homogeneous model surface loaded.')
 
     # convert from surfaces to solution
-    bem = dict(surfs=bem_surfs)
+    bem = ConductorModel(is_sphere=False, surfs=bem_surfs)
     logger.info('\nLoading the solution matrix...\n')
     f, tree, _ = fiff_open(fname)
     with f as fid:
@@ -1201,7 +1393,6 @@ def _add_gamma_multipliers(bem):
     assert len(bem['surfs']) == len(bem['field_mult'])
     bem['gamma'] = ((sigma[1:] - sigma[:-1])[np.newaxis, :] /
                     (sigma[1:] + sigma[:-1])[:, np.newaxis])
-    bem['is_sphere'] = False
 
 
 _surf_dict = {'inner_skull': FIFF.FIFFV_BEM_SURF_ID_BRAIN,
@@ -1231,21 +1422,6 @@ def _bem_explain_surface(id_):
 
 # ############################################################################
 # Write
-
-@deprecated('write_bem_surface is deprecated and will be removed in 0.11, '
-            'use write_bem_surfaces instead')
-def write_bem_surface(fname, surf):
-    """Write one bem surface
-
-    Parameters
-    ----------
-    fname : string
-        File to write
-    surf : dict
-        A surface structured as obtained with read_bem_surfaces
-    """
-    write_bem_surfaces(fname, surf)
-
 
 def write_bem_surfaces(fname, surfs):
     """Write BEM surfaces to a fiff file
@@ -1292,9 +1468,14 @@ def write_bem_solution(fname, bem):
     ----------
     fname : str
         The filename to use.
-    bem : dict
+    bem : instance of ConductorModel
         The BEM model with solution to save.
+
+    See Also
+    --------
+    read_bem_solution
     """
+    _check_bem_size(bem['surfs'])
     with start_file(fname) as fid:
         start_block(fid, FIFF.FIFFB_BEM)
         # Coordinate frame (mainly for backward compatibility)
@@ -1311,3 +1492,373 @@ def write_bem_solution(fname, bem):
                                bem['solution'])
         end_block(fid, FIFF.FIFFB_BEM)
         end_file(fid)
+
+
+# #############################################################################
+# Create 3-Layers BEM model from Flash MRI images
+
+def _prepare_env(subject, subjects_dir, requires_freesurfer, requires_mne):
+    """Helper to prepare an env object for subprocess calls"""
+    env = os.environ.copy()
+    if requires_freesurfer and not os.environ.get('FREESURFER_HOME'):
+        raise RuntimeError('I cannot find freesurfer. The FREESURFER_HOME '
+                           'environment variable is not set.')
+    if requires_mne and not os.environ.get('MNE_ROOT'):
+        raise RuntimeError('I cannot find the MNE command line tools. The '
+                           'MNE_ROOT environment variable is not set.')
+
+    if not isinstance(subject, string_types):
+        raise TypeError('The subject argument must be set')
+
+    subjects_dir = get_subjects_dir(subjects_dir, raise_error=True)
+    if not op.isdir(subjects_dir):
+        raise RuntimeError('Could not find the MRI data directory "%s"'
+                           % subjects_dir)
+    subject_dir = op.join(subjects_dir, subject)
+    if not op.isdir(subject_dir):
+        raise RuntimeError('Could not find the subject data directory "%s"'
+                           % (subject_dir,))
+    env['SUBJECT'] = subject
+    env['SUBJECTS_DIR'] = subjects_dir
+    mri_dir = op.join(subject_dir, 'mri')
+    bem_dir = op.join(subject_dir, 'bem')
+    return env, mri_dir, bem_dir
+
+
+@verbose
+def convert_flash_mris(subject, flash30=True, convert=True, unwarp=False,
+                       subjects_dir=None, verbose=None):
+    """Convert DICOM files for use with make_flash_bem
+
+    Parameters
+    ----------
+    subject : str
+        Subject name.
+    flash30 : bool
+        Use 30-degree flip angle data.
+    convert : bool
+        Assume that the Flash MRI images have already been converted
+        to mgz files.
+    unwarp : bool
+        Run grad_unwarp with -unwarp option on each of the converted
+        data sets. It requires FreeSurfer's MATLAB toolbox to be properly
+        installed.
+    subjects_dir : string, or None
+        Path to SUBJECTS_DIR if it is not set in the environment.
+    verbose : bool, str, int, or None
+        If not None, override default verbose level (see mne.verbose).
+
+    Notes
+    -----
+    Before running this script do the following:
+    (unless convert=False is specified)
+
+        1. Copy all of your FLASH images in a single directory <source> and
+           create a directory <dest> to hold the output of mne_organize_dicom
+        2. cd to <dest> and run
+           $ mne_organize_dicom <source>
+           to create an appropriate directory structure
+        3. Create symbolic links to make flash05 and flash30 point to the
+           appropriate series:
+           $ ln -s <FLASH 5 series dir> flash05
+           $ ln -s <FLASH 30 series dir> flash30
+           Some partition formats (e.g. FAT32) do not support symbolic links.
+           In this case, copy the file to the appropriate series:
+           $ cp <FLASH 5 series dir> flash05
+           $ cp <FLASH 30 series dir> flash30
+        4. cd to the directory where flash05 and flash30 links are
+        5. Set SUBJECTS_DIR and SUBJECT environment variables appropriately
+        6. Run this script
+
+    This function assumes that the Freesurfer segmentation of the subject
+    has been completed. In particular, the T1.mgz and brain.mgz MRI volumes
+    should be, as usual, in the subject's mri directory.
+    """
+    env, mri_dir = _prepare_env(subject, subjects_dir,
+                                requires_freesurfer=True,
+                                requires_mne=False)[:2]
+    curdir = os.getcwd()
+    # Step 1a : Data conversion to mgz format
+    if not op.exists(op.join(mri_dir, 'flash', 'parameter_maps')):
+        os.makedirs(op.join(mri_dir, 'flash', 'parameter_maps'))
+    echos_done = 0
+    if convert:
+        logger.info("\n---- Converting Flash images ----")
+        echos = ['001', '002', '003', '004', '005', '006', '007', '008']
+        if flash30:
+            flashes = ['05']
+        else:
+            flashes = ['05', '30']
+        #
+        missing = False
+        for flash in flashes:
+            for echo in echos:
+                if not op.isdir(op.join('flash' + flash, echo)):
+                    missing = True
+        if missing:
+            echos = ['002', '003', '004', '005', '006', '007', '008', '009']
+            for flash in flashes:
+                for echo in echos:
+                    if not op.isdir(op.join('flash' + flash, echo)):
+                        raise RuntimeError("Directory %s is missing."
+                                           % op.join('flash' + flash, echo))
+        #
+        for flash in flashes:
+            for echo in echos:
+                if not op.isdir(op.join('flash' + flash, echo)):
+                    raise RuntimeError("Directory %s is missing."
+                                       % op.join('flash' + flash, echo))
+                sample_file = glob.glob(op.join('flash' + flash, echo, '*'))[0]
+                dest_file = op.join(mri_dir, 'flash',
+                                    'mef' + flash + '_' + echo + '.mgz')
+                # do not redo if already present
+                if op.isfile(dest_file):
+                    logger.info("The file %s is already there")
+                else:
+                    cmd = ['mri_convert', sample_file, dest_file]
+                    run_subprocess(cmd, env=env, stdout=sys.stdout,
+                                   stderr=sys.stderr)
+                    echos_done += 1
+    # Step 1b : Run grad_unwarp on converted files
+    os.chdir(op.join(mri_dir, "flash"))
+    files = glob.glob("mef*.mgz")
+    if unwarp:
+        logger.info("\n---- Unwarp mgz data sets ----")
+        for infile in files:
+            outfile = infile.replace(".mgz", "u.mgz")
+            cmd = ['grad_unwarp', '-i', infile, '-o', outfile, '-unwarp',
+                   'true']
+            run_subprocess(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
+    # Clear parameter maps if some of the data were reconverted
+    if echos_done > 0 and op.exists("parameter_maps"):
+        shutil.rmtree("parameter_maps")
+        logger.info("\nParameter maps directory cleared")
+    if not op.exists("parameter_maps"):
+        os.makedirs("parameter_maps")
+    # Step 2 : Create the parameter maps
+    if flash30:
+        logger.info("\n---- Creating the parameter maps ----")
+        if unwarp:
+            files = glob.glob("mef05*u.mgz")
+        if len(os.listdir('parameter_maps')) == 0:
+            cmd = ['mri_ms_fitparms'] + files + ['parameter_maps']
+            run_subprocess(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
+        else:
+            logger.info("Parameter maps were already computed")
+        # Step 3 : Synthesize the flash 5 images
+        logger.info("\n---- Synthesizing flash 5 images ----")
+        os.chdir('parameter_maps')
+        if not op.exists('flash5.mgz'):
+            cmd = ['mri_synthesize', '20 5 5', 'T1.mgz', 'PD.mgz',
+                   'flash5.mgz']
+            run_subprocess(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
+            os.remove('flash5_reg.mgz')
+        else:
+            logger.info("Synthesized flash 5 volume is already there")
+    else:
+        logger.info("\n---- Averaging flash5 echoes ----")
+        os.chdir('parameter_maps')
+        if unwarp:
+            files = glob.glob("mef05*u.mgz")
+        else:
+            files = glob.glob("mef05*.mgz")
+        cmd = ['mri_average', '-noconform', files, 'flash5.mgz']
+        run_subprocess(cmd, env=env, stdout=sys.stdout)
+        if op.exists('flash5_reg.mgz'):
+            os.remove('flash5_reg.mgz')
+
+    # Go back to initial directory
+    os.chdir(curdir)
+
+
+@verbose
+def make_flash_bem(subject, overwrite=False, show=True, subjects_dir=None,
+                   flash_path=None, verbose=None):
+    """Create 3-Layer BEM model from prepared flash MRI images
+
+    Parameters
+    -----------
+    subject : str
+        Subject name.
+    overwrite : bool
+        Write over existing .surf files in bem folder.
+    show : bool
+        Show surfaces to visually inspect all three BEM surfaces (recommended).
+    subjects_dir : string, or None
+        Path to SUBJECTS_DIR if it is not set in the environment.
+    flash_path : str | None
+        Path to the flash images. If None (default), mri/flash/parameter_maps
+        within the subject reconstruction is used.
+
+        .. versionadded:: 0.13.0
+
+    verbose : bool, str, int, or None
+        If not None, override default verbose level (see mne.verbose).
+
+    Notes
+    -----
+    This program assumes that FreeSurfer is installed and sourced properly.
+
+    This function extracts the BEM surfaces (outer skull, inner skull, and
+    outer skin) from multiecho FLASH MRI data with spin angles of 5 and 30
+    degrees, in mgz format.
+
+    See Also
+    --------
+    convert_flash_mris
+    """
+    from .viz.misc import plot_bem
+    from .surface import write_surface, read_tri
+
+    is_test = os.environ.get('MNE_SKIP_FS_FLASH_CALL', False)
+
+    env, mri_dir, bem_dir = _prepare_env(subject, subjects_dir,
+                                         requires_freesurfer=True,
+                                         requires_mne=False)
+
+    if flash_path is None:
+        flash_path = op.join(mri_dir, 'flash', 'parameter_maps')
+    else:
+        flash_path = op.abspath(flash_path)
+    curdir = os.getcwd()
+    subjects_dir = env['SUBJECTS_DIR']
+
+    logger.info('\nProcessing the flash MRI data to produce BEM meshes with '
+                'the following parameters:\n'
+                'SUBJECTS_DIR = %s\n'
+                'SUBJECT = %s\n'
+                'Result dir = %s\n' % (subjects_dir, subject,
+                                       op.join(bem_dir, 'flash')))
+    # Step 4 : Register with MPRAGE
+    logger.info("\n---- Registering flash 5 with MPRAGE ----")
+    flash5 = op.join(flash_path, 'flash5.mgz')
+    flash5_reg = op.join(flash_path, 'flash5_reg.mgz')
+    if not op.exists(flash5_reg):
+        if op.exists(op.join(mri_dir, 'T1.mgz')):
+            ref_volume = op.join(mri_dir, 'T1.mgz')
+        else:
+            ref_volume = op.join(mri_dir, 'T1')
+        cmd = ['fsl_rigid_register', '-r', ref_volume, '-i', flash5,
+               '-o', flash5_reg]
+        run_subprocess(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
+    else:
+        logger.info("Registered flash 5 image is already there")
+    # Step 5a : Convert flash5 into COR
+    logger.info("\n---- Converting flash5 volume into COR format ----")
+    shutil.rmtree(op.join(mri_dir, 'flash5'), ignore_errors=True)
+    os.makedirs(op.join(mri_dir, 'flash5'))
+    if not is_test:  # CIs don't have freesurfer, skipped when testing.
+        cmd = ['mri_convert', flash5_reg, op.join(mri_dir, 'flash5')]
+        run_subprocess(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
+    # Step 5b and c : Convert the mgz volumes into COR
+    os.chdir(mri_dir)
+    convert_T1 = False
+    if not op.isdir('T1') or len(glob.glob(op.join('T1', 'COR*'))) == 0:
+        convert_T1 = True
+    convert_brain = False
+    if not op.isdir('brain') or len(glob.glob(op.join('brain', 'COR*'))) == 0:
+        convert_brain = True
+    logger.info("\n---- Converting T1 volume into COR format ----")
+    if convert_T1:
+        if not op.isfile('T1.mgz'):
+            raise RuntimeError("Both T1 mgz and T1 COR volumes missing.")
+        os.makedirs('T1')
+        cmd = ['mri_convert', 'T1.mgz', 'T1']
+        run_subprocess(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
+    else:
+        logger.info("T1 volume is already in COR format")
+    logger.info("\n---- Converting brain volume into COR format ----")
+    if convert_brain:
+        if not op.isfile('brain.mgz'):
+            raise RuntimeError("Both brain mgz and brain COR volumes missing.")
+        os.makedirs('brain')
+        cmd = ['mri_convert', 'brain.mgz', 'brain']
+        run_subprocess(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
+    else:
+        logger.info("Brain volume is already in COR format")
+    # Finally ready to go
+    if not is_test:  # CIs don't have freesurfer, skipped when testing.
+        logger.info("\n---- Creating the BEM surfaces ----")
+        cmd = ['mri_make_bem_surfaces', subject]
+        run_subprocess(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
+
+    logger.info("\n---- Converting the tri files into surf files ----")
+    os.chdir(bem_dir)
+    if not op.exists('flash'):
+        os.makedirs('flash')
+    os.chdir('flash')
+    surfs = ['inner_skull', 'outer_skull', 'outer_skin']
+    for surf in surfs:
+        shutil.move(op.join(bem_dir, surf + '.tri'), surf + '.tri')
+
+        nodes, tris = read_tri(surf + '.tri', swap=True)
+        vol_info = _extract_volume_info(flash5_reg)
+        if vol_info is None:
+            warn('nibabel is required to update the volume info. Volume info '
+                 'omitted from the written surface.')
+        else:
+            vol_info['head'] = np.array([20])
+        write_surface(surf + '.surf', nodes, tris, volume_info=vol_info)
+
+    # Cleanup section
+    logger.info("\n---- Cleaning up ----")
+    os.chdir(bem_dir)
+    os.remove('inner_skull_tmp.tri')
+    os.chdir(mri_dir)
+    if convert_T1:
+        shutil.rmtree('T1')
+        logger.info("Deleted the T1 COR volume")
+    if convert_brain:
+        shutil.rmtree('brain')
+        logger.info("Deleted the brain COR volume")
+    shutil.rmtree('flash5')
+    logger.info("Deleted the flash5 COR volume")
+    # Create symbolic links to the .surf files in the bem folder
+    logger.info("\n---- Creating symbolic links ----")
+    os.chdir(bem_dir)
+    for surf in surfs:
+        surf = surf + '.surf'
+        if not overwrite and op.exists(surf):
+            skip_symlink = True
+        else:
+            if op.exists(surf):
+                os.remove(surf)
+            _symlink(op.join('flash', surf), op.join(surf))
+            skip_symlink = False
+    if skip_symlink:
+        logger.info("Unable to create all symbolic links to .surf files "
+                    "in bem folder. Use --overwrite option to recreate them.")
+        dest = op.join(bem_dir, 'flash')
+    else:
+        logger.info("Symbolic links to .surf files created in bem folder")
+        dest = bem_dir
+    logger.info("\nThank you for waiting.\nThe BEM triangulations for this "
+                "subject are now available at:\n%s.\nWe hope the BEM meshes "
+                "created will facilitate your MEG and EEG data analyses."
+                % dest)
+    # Show computed BEM surfaces
+    if show:
+        plot_bem(subject=subject, subjects_dir=subjects_dir,
+                 orientation='coronal', slices=None, show=True)
+
+    # Go back to initial directory
+    os.chdir(curdir)
+
+
+def _check_bem_size(surfs):
+    """Helper for checking bem surface sizes."""
+    if surfs[0]['np'] > 10000:
+        msg = ('The bem surface has %s data points. 5120 (ico grade=4) should '
+               'be enough.' % surfs[0]['np'])
+        if len(surfs) == 3:
+            msg += ' Dense 3-layer bems may not save properly.'
+        warn(msg)
+
+
+def _symlink(src, dest):
+    try:
+        os.symlink(src, dest)
+    except OSError:
+        warn('Could not create symbolic link %s. Check that your partition '
+             'handles symbolic links. The file will be copied instead.' % dest)
+        shutil.copy(src, dest)

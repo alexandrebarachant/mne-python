@@ -8,18 +8,17 @@
 
 import os.path as op
 import warnings
-from collections import namedtuple
 from nose.tools import assert_raises
 
 import numpy as np
-
+from numpy.testing import assert_equal
 
 from mne import io, read_events, Epochs
 from mne import pick_types
-from mne.utils import run_tests_if_main, requires_scipy_version
+from mne.utils import run_tests_if_main, requires_version
 from mne.channels import read_layout
 
-from mne.viz import plot_drop_log, plot_image_epochs, _get_presser
+from mne.viz import plot_drop_log
 from mne.viz.utils import _fake_click
 
 # Set our plotters to test mode
@@ -40,7 +39,7 @@ layout = read_layout('Vectorview-all')
 
 
 def _get_raw():
-    return io.Raw(raw_fname, preload=False)
+    return io.read_raw_fif(raw_fname, preload=False)
 
 
 def _get_events():
@@ -58,8 +57,9 @@ def _get_epochs():
     picks = _get_picks(raw)
     # Use a subset of channels for plotting speed
     picks = np.round(np.linspace(0, len(picks) + 1, n_chan)).astype(int)
-    epochs = Epochs(raw, events[:5], event_id, tmin, tmax, picks=picks,
-                    baseline=(None, 0))
+    with warnings.catch_warnings(record=True):  # bad proj
+        epochs = Epochs(raw, events[:5], event_id, tmin, tmax, picks=picks,
+                        baseline=(None, 0))
     return epochs
 
 
@@ -74,42 +74,17 @@ def _get_epochs_delayed_ssp():
     return epochs_delayed_ssp
 
 
-def test_plot_trellis():
-    """ Test plotting epochs using Trellis plot"""
-    import matplotlib.pyplot as plt
-    epochs = _get_epochs()
-    epochs.plot([0, 1], picks=[0, 2, 3], scalings=None, title_str='%s')
-    plt.close('all')
-    epochs[0].plot(picks=[0, 2, 3], scalings=None, title_str='%s')
-    plt.close('all')
-    # now let's add a bad channel
-    epochs.info['bads'] = [epochs.ch_names[0]]  # include a bad one
-    epochs.plot([0, 1], picks=[0, 2, 3], scalings=None, title_str='%s')
-    plt.close('all')
-    fig = epochs[0].plot(picks=[0, 2, 3], scalings=None, title_str='%s')
-    plt.close('all')
-    fig = epochs.plot([0, 1], picks=[0, 2, 3], scalings=None, title_str='%s')
-    # fake a click
-    event = namedtuple('Event', 'inaxes')
-    func = _get_presser(fig)
-    func(event(inaxes=fig.axes[0]))
-    # now do a click in the nav
-    nav_fig = func.keywords['params']['navigation']
-    func = _get_presser(nav_fig)
-    func(event(inaxes=nav_fig.axes[1]))
-    plt.close('all')
-
-
 def test_plot_epochs():
     """Test epoch plotting"""
     import matplotlib.pyplot as plt
     epochs = _get_epochs()
-    epochs.plot(scalings=None, title='Epochs', trellis=False)
+    epochs.info.normalize_proj()  # avoid warnings
+    epochs.plot(scalings=None, title='Epochs')
     plt.close('all')
-    fig = epochs[0].plot(picks=[0, 2, 3], scalings=None, trellis=False)
+    fig = epochs[0].plot(picks=[0, 2, 3], scalings=None)
     fig.canvas.key_press_event('escape')
     plt.close('all')
-    fig = epochs.plot(trellis=False)
+    fig = epochs.plot()
     fig.canvas.key_press_event('left')
     fig.canvas.key_press_event('right')
     fig.canvas.scroll_event(0.5, 0.5, -0.5)  # scroll down
@@ -131,10 +106,10 @@ def test_plot_epochs():
     fig.canvas.resize_event()
     fig.canvas.close_event()  # closing and epoch dropping
     plt.close('all')
-    assert_raises(RuntimeError, epochs.plot, picks=[], trellis=False)
+    assert_raises(RuntimeError, epochs.plot, picks=[])
     plt.close('all')
     with warnings.catch_warnings(record=True):
-        fig = epochs.plot(trellis=False)
+        fig = epochs.plot()
         # test mouse clicks
         x = fig.get_axes()[0].get_xlim()[1] / 2
         y = fig.get_axes()[0].get_ylim()[0] / 2
@@ -144,19 +119,34 @@ def test_plot_epochs():
         _fake_click(fig, data_ax, [x, y], xform='data')  # unmark a bad epoch
         _fake_click(fig, data_ax, [0.5, 0.999])  # click elsewhere in 1st axes
         _fake_click(fig, data_ax, [-0.1, 0.9])  # click on y-label
+        _fake_click(fig, data_ax, [-0.1, 0.9], button=3)
         _fake_click(fig, fig.get_axes()[2], [0.5, 0.5])  # change epochs
         _fake_click(fig, fig.get_axes()[3], [0.5, 0.5])  # change channels
         fig.canvas.close_event()  # closing and epoch dropping
         assert(n_epochs - 1 == len(epochs))
         plt.close('all')
+    epochs.plot_sensors()  # Test plot_sensors
+    plt.close('all')
 
 
-def test_plot_image_epochs():
+def test_plot_epochs_image():
     """Test plotting of epochs image
     """
     import matplotlib.pyplot as plt
     epochs = _get_epochs()
-    plot_image_epochs(epochs, picks=[1, 2])
+    epochs.plot_image(picks=[1, 2])
+    overlay_times = [0.1]
+    epochs.plot_image(order=[0], overlay_times=overlay_times, vmin=0.01)
+    epochs.plot_image(overlay_times=overlay_times, vmin=-0.001, vmax=0.001)
+    assert_raises(ValueError, epochs.plot_image,
+                  overlay_times=[0.1, 0.2])
+    assert_raises(ValueError, epochs.plot_image,
+                  order=[0, 1])
+    with warnings.catch_warnings(record=True) as w:
+        epochs.plot_image(overlay_times=[1.1])
+        warnings.simplefilter('always')
+    assert_equal(len(w), 1)
+
     plt.close('all')
 
 
@@ -166,7 +156,7 @@ def test_plot_drop_log():
     import matplotlib.pyplot as plt
     epochs = _get_epochs()
     assert_raises(ValueError, epochs.plot_drop_log)
-    epochs.drop_bad_epochs()
+    epochs.drop_bad()
 
     warnings.simplefilter('always', UserWarning)
     with warnings.catch_warnings(record=True):
@@ -178,7 +168,7 @@ def test_plot_drop_log():
     plt.close('all')
 
 
-@requires_scipy_version('0.12')
+@requires_version('scipy', '0.12')
 def test_plot_psd_epochs():
     """Test plotting epochs psd (+topomap)
     """

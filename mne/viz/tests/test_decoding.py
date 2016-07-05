@@ -30,7 +30,8 @@ def _get_data(tmin=-0.2, tmax=0.5, event_id=dict(aud_l=1, vis_l=3),
               event_id_gen=dict(aud_l=2, vis_l=4), test_times=None):
     """Aux function for testing GAT viz"""
     gat = GeneralizationAcrossTime()
-    raw = io.Raw(raw_fname, preload=False)
+    raw = io.read_raw_fif(raw_fname, preload=False)
+    raw.add_proj([], remove_existing=True)
     events = read_events(event_name)
     picks = pick_types(raw.info, meg='mag', stim=False, ecg=False,
                        eog=False, exclude='bads')
@@ -79,7 +80,8 @@ def test_gat_plot_times():
     gat.plot_times(gat.train_times_['times'])
     # test multiple colors
     n_times = len(gat.train_times_['times'])
-    colors = np.tile(['r', 'g', 'b'], np.ceil(n_times / 3))[:n_times]
+    colors = np.tile(['r', 'g', 'b'],
+                     int(np.ceil(n_times / 3)))[:n_times]
     gat.plot_times(gat.train_times_['times'], color=colors)
     # test invalid time point
     assert_raises(ValueError, gat.plot_times, -1.)

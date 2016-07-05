@@ -4,9 +4,9 @@
 #
 # License: BSD (3-clause)
 
-from copy import deepcopy
-from inspect import getargspec, isfunction
+from inspect import isfunction
 from collections import namedtuple
+from copy import deepcopy
 
 import os
 import json
@@ -21,7 +21,8 @@ from .infomax_ import infomax
 
 from ..cov import compute_whitener
 from .. import Covariance, Evoked
-from ..io.pick import (pick_types, pick_channels, pick_info)
+from ..io.pick import (pick_types, pick_channels, pick_info,
+                       _pick_data_channels, _DATA_CH_TYPES_SPLIT)
 from ..io.write import (write_double_matrix, write_string,
                         write_name_list, write_int, start_block,
                         end_block)
@@ -34,23 +35,27 @@ from ..io.base import _BaseRaw
 from ..epochs import _BaseEpochs
 from ..viz import (plot_ica_components, plot_ica_scores,
                    plot_ica_sources, plot_ica_overlay)
+from ..viz.ica import plot_ica_properties
+from ..viz.utils import (_prepare_trellis, tight_layout, plt_show,
+                         _setup_vmin_vmax)
+from ..viz.topomap import (_prepare_topo_plot, _check_outlines,
+                           plot_topomap, _hide_frame)
+
 from ..channels.channels import _contains_ch_type, ContainsMixin
 from ..io.write import start_file, end_file, write_id
-from ..utils import (check_sklearn_version, logger, check_fname, verbose,
-                     _reject_data_segments, check_random_state)
+from ..utils import (check_version, logger, check_fname, verbose,
+                     _reject_data_segments, check_random_state,
+                     _get_fast_dot, compute_corr)
+from ..fixes import _get_args
 from ..filter import band_pass_filter
 from .bads import find_outliers
 from .ctps_ import ctps
 from ..externals.six import string_types, text_type
+from ..io.pick import channel_type
 
 
-def _get_fast_dot():
-    """"Helper to get fast dot"""
-    try:
-        from sklearn.utils.extmath import fast_dot
-    except ImportError:
-        fast_dot = np.dot
-    return fast_dot
+__all__ = ['ICA', 'ica_find_ecg_events', 'ica_find_eog_events',
+           'get_score_funcs', 'read_ica', 'run_ica']
 
 
 def _make_xy_sfunc(func, ndim_output=False):
@@ -78,19 +83,35 @@ def get_score_funcs():
                           if isfunction(f) and not n.startswith('_')]
     score_funcs.update(dict((n, _make_xy_sfunc(f))
                             for n, f in xy_arg_dist_funcs
-                            if getargspec(f).args == ['u', 'v']))
+                            if _get_args(f) == ['u', 'v']))
     score_funcs.update(dict((n, _make_xy_sfunc(f, ndim_output=True))
                             for n, f in xy_arg_stats_funcs
-                            if getargspec(f).args == ['x', 'y']))
+                            if _get_args(f) == ['x', 'y']))
     return score_funcs
 
 
-__all__ = ['ICA', 'ica_find_ecg_events', 'ica_find_eog_events',
-           'get_score_funcs', 'read_ica', 'run_ica']
+def _check_for_unsupported_ica_channels(picks, info):
+    """Check for channels in picks that are not considered
+    valid channels. Accepted channels are the data channels
+    ('seeg','ecog','eeg','mag', and 'grad') and 'eog'.
+    This prevents the program from crashing without
+    feedback when a bad channel is provided to ICA whitening.
+    """
+    if picks is None:
+        return
+    elif len(picks) == 0:
+        raise ValueError('No channels provided to ICA')
+    types = _DATA_CH_TYPES_SPLIT + ['eog']
+    chs = list(set([channel_type(info, j) for j in picks]))
+    check = all([ch in types for ch in chs])
+    if not check:
+        raise ValueError('Invalid channel type(s) passed for ICA.\n'
+                         'Only the following channels are supported {}\n'
+                         'Following types were passed {}\n'
+                         .format(types, chs))
 
 
 class ICA(ContainsMixin):
-
     """M/EEG signal decomposition using Independent Component Analysis (ICA)
 
     This object can be used to estimate ICA components and then
@@ -106,12 +127,18 @@ class ICA(ContainsMixin):
         >> ica.fit(raw)
         >> raw.info['projs'] = projs
 
+    .. note:: Methods implemented are FastICA (default), Infomax and
+              Extended-Infomax. Infomax can be quite sensitive to differences
+              in floating point arithmetic due to exponential non-linearity.
+              Extended-Infomax seems to be more stable in this respect
+              enhancing reproducibility and stability of results.
+
     Parameters
     ----------
     n_components : int | float | None
         The number of components used for ICA decomposition. If int, it must be
         smaller then max_pca_components. If None, all PCA components will be
-        used. If float between 0 and 1 components can will be selected by the
+        used. If float between 0 and 1 components will be selected by the
         cumulative percentage of explained variance.
     max_pca_components : int | None
         The number of components used for PCA decomposition. If None, no
@@ -160,7 +187,7 @@ class ICA(ContainsMixin):
         The number of components used for PCA dimensionality reduction.
     verbose : bool, str, int, or None
         See above.
-    ``pca_components_` : ndarray
+    ``pca_components_`` : ndarray
         If fit, the PCA components
     ``pca_mean_`` : ndarray
         If fit, the mean vector used to center the data before doing the PCA.
@@ -178,10 +205,14 @@ class ICA(ContainsMixin):
         .exclude attribute. When saving the ICA also the indices are restored.
         Hence, artifact components once identified don't have to be added
         again. To dump this 'artifact memory' say: ica.exclude = []
-    info : None | instance of mne.io.meas_info.Info
+    info : None | instance of Info
         The measurement info copied from the object fitted.
     `n_samples_` : int
         the number of samples used on fit.
+    `labels_` : dict
+        A dictionary of independent component indices, grouped by types of
+        independent components. This attribute is set by some of the artifact
+        detection functions.
     """
     @verbose
     def __init__(self, n_components=None, max_pca_components=None,
@@ -192,7 +223,7 @@ class ICA(ContainsMixin):
         if method not in methods:
             raise ValueError('`method` must be "%s". You passed: "%s"' %
                              ('" or "'.join(methods), method))
-        if not check_sklearn_version(min_version='0.12'):
+        if not check_version('sklearn', '0.12'):
             raise RuntimeError('the scikit-learn package (version >= 0.12)'
                                'is required for ICA')
 
@@ -218,6 +249,10 @@ class ICA(ContainsMixin):
 
         if fit_params is None:
             fit_params = {}
+        fit_params = deepcopy(fit_params)  # avoid side effects
+        if "extended" in fit_params:
+            raise ValueError("'extended' parameter provided. You should "
+                             "rather use method='extended-infomax'.")
         if method == 'fastica':
             update = {'algorithm': 'parallel', 'fun': 'logcosh',
                       'fun_args': None}
@@ -251,7 +286,7 @@ class ICA(ContainsMixin):
               hasattr(self, 'n_components_') else
               'no dimension reduction')
         if self.info is not None:
-            ch_fit = ['"%s"' % c for c in ['mag', 'grad', 'eeg'] if c in self]
+            ch_fit = ['"%s"' % c for c in _DATA_CH_TYPES_SPLIT if c in self]
             s += ', channels used: {0}'.format('; '.join(ch_fit))
         if self.exclude:
             s += ', %i sources marked for exclusion' % len(self.exclude)
@@ -286,21 +321,21 @@ class ICA(ContainsMixin):
             within ``start`` and ``stop`` are used.
         reject : dict | None
             Rejection parameters based on peak-to-peak amplitude.
-            Valid keys are 'grad' | 'mag' | 'eeg' | 'eog' | 'ecg'.
+            Valid keys are 'grad', 'mag', 'eeg', 'seeg', 'ecog', 'eog', 'ecg'.
             If reject is None then no rejection is done. Example::
 
                 reject = dict(grad=4000e-13, # T / m (gradiometers)
                               mag=4e-12, # T (magnetometers)
-                              eeg=40e-6, # uV (EEG channels)
-                              eog=250e-6 # uV (EOG channels)
+                              eeg=40e-6, # V (EEG channels)
+                              eog=250e-6 # V (EOG channels)
                               )
 
             It only applies if `inst` is of type Raw.
         flat : dict | None
             Rejection parameters based on flatness of signal.
-            Valid keys are 'grad' | 'mag' | 'eeg' | 'eog' | 'ecg', and values
-            are floats that set the minimum acceptable peak-to-peak amplitude.
-            If flat is None then no rejection is done.
+            Valid keys are 'grad', 'mag', 'eeg', 'seeg', 'ecog', 'eog', 'ecg'.
+            Values are floats that set the minimum acceptable peak-to-peak
+            amplitude. If flat is None then no rejection is done.
             It only applies if `inst` is of type Raw.
         tstep : float
             Length of data chunks for artifact rejection in seconds.
@@ -314,11 +349,13 @@ class ICA(ContainsMixin):
         self : instance of ICA
             Returns the modified instance.
         """
-        if isinstance(inst, _BaseRaw):
-            self._fit_raw(inst, picks, start, stop, decim, reject, flat,
-                          tstep, verbose)
-        elif isinstance(inst, _BaseEpochs):
-            self._fit_epochs(inst, picks, decim, verbose)
+        if isinstance(inst, _BaseRaw) or isinstance(inst, _BaseEpochs):
+            _check_for_unsupported_ica_channels(picks, inst.info)
+            if isinstance(inst, _BaseRaw):
+                self._fit_raw(inst, picks, start, stop, decim, reject, flat,
+                              tstep, verbose)
+            elif isinstance(inst, _BaseEpochs):
+                self._fit_epochs(inst, picks, decim, verbose)
         else:
             raise ValueError('Data input must be of Raw or Epochs type')
         return self
@@ -344,9 +381,9 @@ class ICA(ContainsMixin):
             self._reset()
 
         if picks is None:  # just use good data channels
-            picks = pick_types(raw.info, meg=True, eeg=True, eog=False,
-                               ecg=False, misc=False, stim=False,
-                               ref_meg=False, exclude='bads')
+            picks = _pick_data_channels(raw.info, exclude='bads',
+                                        with_ref_meg=False)
+
         logger.info('Fitting ICA to data using %i channels. \n'
                     'Please be patient, this may take some time' % len(picks))
 
@@ -360,19 +397,21 @@ class ICA(ContainsMixin):
         self.ch_names = self.info['ch_names']
         start, stop = _check_start_stop(raw, start, stop)
 
+        # this will be a copy
         data = raw[picks, start:stop][0]
+        # this will be a view
         if decim is not None:
-            data = data[:, ::decim].copy()
+            data = data[:, ::decim]
 
+        # this will make a copy
         if (reject is not None) or (flat is not None):
             data, self.drop_inds_ = _reject_data_segments(data, reject, flat,
                                                           decim, self.info,
                                                           tstep)
 
         self.n_samples_ = data.shape[1]
-
-        data, self._pre_whitener = self._pre_whiten(data,
-                                                    raw.info, picks)
+        # this may operate inplace or make a copy
+        data, self._pre_whitener = self._pre_whiten(data, raw.info, picks)
 
         self._fit(data, self.max_pca_components, 'raw')
 
@@ -385,9 +424,8 @@ class ICA(ContainsMixin):
             self._reset()
 
         if picks is None:
-            picks = pick_types(epochs.info, meg=True, eeg=True, eog=False,
-                               ecg=False, misc=False, stim=False,
-                               ref_meg=False, exclude='bads')
+            picks = _pick_data_channels(epochs.info, exclude='bads',
+                                        with_ref_meg=False)
         logger.info('Fitting ICA to data using %i channels. \n'
                     'Please be patient, this may take some time' % len(picks))
 
@@ -401,12 +439,16 @@ class ICA(ContainsMixin):
             self.max_pca_components = len(picks)
             logger.info('Inferring max_pca_components from picks.')
 
+        # this should be a copy (picks a list of int)
         data = epochs.get_data()[:, picks]
+        # this will be a view
         if decim is not None:
-            data = data[:, :, ::decim].copy()
+            data = data[:, :, ::decim]
 
         self.n_samples_ = np.prod(data[:, 0, :].shape)
 
+        # This will make at least one copy (one from hstack, maybe one
+        # more from _pre_whiten)
         data, self._pre_whitener = \
             self._pre_whiten(np.hstack(data), epochs.info, picks)
 
@@ -421,14 +463,24 @@ class ICA(ContainsMixin):
         if not has_pre_whitener and self.noise_cov is None:
             # use standardization as whitener
             # Scale (z-score) the data by channel type
-            info = pick_info(deepcopy(info), picks)
+            info = pick_info(info, picks)
             pre_whitener = np.empty([len(data), 1])
-            for ch_type in ['mag', 'grad', 'eeg']:
+            for ch_type in _DATA_CH_TYPES_SPLIT + ['eog']:
                 if _contains_ch_type(info, ch_type):
-                    if ch_type == 'eeg':
+                    if ch_type == 'seeg':
+                        this_picks = pick_types(info, meg=False, seeg=True)
+                    elif ch_type == 'ecog':
+                        this_picks = pick_types(info, meg=False, ecog=True)
+                    elif ch_type == 'eeg':
                         this_picks = pick_types(info, meg=False, eeg=True)
+                    elif ch_type in ['mag', 'grad']:
+                        this_picks = pick_types(info, meg=ch_type)
+                    elif ch_type == 'eog':
+                        this_picks = pick_types(info, meg=False, eog=True)
                     else:
-                        this_picks = pick_types(info, meg=ch_type, eeg=False)
+                        raise RuntimeError('Should not be reached.'
+                                           'Unsupported channel {}'
+                                           .format(ch_type))
                     pre_whitener[this_picks] = np.std(data[this_picks])
             data /= pre_whitener
         elif not has_pre_whitener and self.noise_cov is not None:
@@ -647,7 +699,7 @@ class ICA(ContainsMixin):
         # populate copied raw.
         start, stop = _check_start_stop(raw, start, stop)
         if add_channels is not None:
-            raw_picked = raw.pick_channels(add_channels, copy=True)
+            raw_picked = raw.copy().pick_channels(add_channels)
             data_, times_ = raw_picked[:, start:stop]
             data_ = np.r_[sources, data_]
         else:
@@ -711,7 +763,7 @@ class ICA(ContainsMixin):
         """Aux method
         """
         # set channel names and info
-        ch_names = info['ch_names'] = []
+        ch_names = []
         ch_info = info['chs'] = []
         for ii in range(self.n_components_):
             this_source = 'ICA %03d' % (ii + 1)
@@ -721,9 +773,8 @@ class ICA(ContainsMixin):
                                 kind=FIFF.FIFFV_MISC_CH,
                                 coord_Frame=FIFF.FIFFV_COORD_UNKNOWN,
                                 loc=np.array([0., 0., 0., 1.] * 3, dtype='f4'),
-                                unit=FIFF.FIFF_UNIT_NONE, eeg_loc=None,
-                                range=1.0, scanno=ii + 1, unit_mul=0,
-                                coil_trans=None))
+                                unit=FIFF.FIFF_UNIT_NONE,
+                                range=1.0, scanno=ii + 1, unit_mul=0))
 
         if add_channels is not None:
             # re-append additionally picked ch_names
@@ -731,12 +782,10 @@ class ICA(ContainsMixin):
             # re-append additionally picked ch_info
             ch_info += [k for k in container.info['chs'] if k['ch_name'] in
                         add_channels]
-            # update number of channels
-        info['nchan'] = self.n_components_
-        if add_channels is not None:
-            info['nchan'] += len(add_channels)
         info['bads'] = [ch_names[k] for k in self.exclude]
         info['projs'] = []  # make sure projections are removed.
+        info._update_redundant()
+        info._check_consistency()
 
     @verbose
     def score_sources(self, inst, target=None, score_func='pearsonr',
@@ -758,11 +807,11 @@ class ICA(ContainsMixin):
             Callable taking as arguments either two input arrays
             (e.g. Pearson correlation) or one input
             array (e. g. skewness) and returns a float. For convenience the
-            most common score_funcs are available via string labels: Currently,
-            all distance metrics from scipy.spatial and all functions from
-            scipy.stats taking compatible input arguments are supported. These
-            function have been modified to support iteration over the rows of a
-            2D array.
+            most common score_funcs are available via string labels:
+            Currently, all distance metrics from scipy.spatial and All
+            functions from scipy.stats taking compatible input arguments are
+            supported. These function have been modified to support iteration
+            over the rows of a 2D array.
         start : int | float | None
             First sample to include. If float, data will be interpreted as
             time in seconds. If None, data will be used from the first sample.
@@ -887,6 +936,10 @@ class ICA(ContainsMixin):
         scores : np.ndarray of float, shape (``n_components_``)
             The correlation scores.
 
+        See also
+        --------
+        find_bads_eog
+
         References
         ----------
         [1] Dammers, J., Schiek, M., Boers, F., Silex, C., Zvyagintsev,
@@ -904,7 +957,7 @@ class ICA(ContainsMixin):
             if verbose is not None:
                 verbose = self.verbose
             ecg, times = _make_ecg(inst, start, stop, verbose)
-            ch_name = 'ECG'
+            ch_name = 'ECG-MAG'
         else:
             ecg = inst.ch_names[idx_ecg]
 
@@ -913,7 +966,7 @@ class ICA(ContainsMixin):
             extra_picks = pick_types(inst.info, meg=False, ecg=True)
             ch_names_to_pick = (self.ch_names +
                                 [inst.ch_names[k] for k in extra_picks])
-            inst = inst.pick_channels(ch_names_to_pick, copy=True)
+            inst = inst.copy().pick_channels(ch_names_to_pick)
 
         if method == 'ctps':
             if threshold is None:
@@ -941,7 +994,11 @@ class ICA(ContainsMixin):
             raise ValueError('Method "%s" not supported.' % method)
         # sort indices by scores
         ecg_idx = ecg_idx[np.abs(scores[ecg_idx]).argsort()[::-1]]
-        return list(ecg_idx), scores
+        if not hasattr(self, 'labels_') or self.labels_ is None:
+            self.labels_ = dict()
+        self.labels_['ecg'] = list(ecg_idx)
+        self.labels_['ecg/%s' % ch_name] = list(ecg_idx)
+        return self.labels_['ecg'], scores
 
     @verbose
     def find_bads_eog(self, inst, ch_name=None, threshold=3.0,
@@ -961,7 +1018,7 @@ class ICA(ContainsMixin):
             Object to compute sources from.
         ch_name : str
             The name of the channel to use for EOG peak detection.
-            The argument is mandatory if the dataset contains no ECG
+            The argument is mandatory if the dataset contains no EOG
             channels.
         threshold : int | float
             The value above which a feature is classified as outlier.
@@ -985,6 +1042,10 @@ class ICA(ContainsMixin):
             The indices of EOG related components, sorted by score.
         scores : np.ndarray of float, shape (``n_components_``) | list of array
             The correlation scores.
+
+        See Also
+        --------
+        find_bads_ecg
         """
         if verbose is None:
             verbose = self.verbose
@@ -1001,15 +1062,21 @@ class ICA(ContainsMixin):
         targets = [self._check_target(k, inst, start, stop) for k in eog_chs]
 
         if inst.ch_names != self.ch_names:
-            inst = inst.pick_channels(self.ch_names, copy=True)
+            inst = inst.copy().pick_channels(self.ch_names)
 
-        for eog_ch, target in zip(eog_chs, targets):
+        if not hasattr(self, 'labels_') or self.labels_ is None:
+            self.labels_ = dict()
+
+        for ii, (eog_ch, target) in enumerate(zip(eog_chs, targets)):
             scores += [self.score_sources(inst, target=target,
                                           score_func='pearsonr',
                                           start=start, stop=stop,
                                           l_freq=l_freq, h_freq=h_freq,
                                           verbose=verbose)]
-            eog_idx += [find_outliers(scores[-1], threshold=threshold)]
+            # pick last scores
+            this_idx = find_outliers(scores[-1], threshold=threshold)
+            eog_idx += [this_idx]
+            self.labels_[('eog/%i/' % ii) + eog_ch] = list(this_idx)
 
         # remove duplicates but keep order by score, even across multiple
         # EOG channels
@@ -1025,12 +1092,12 @@ class ICA(ContainsMixin):
                 eog_idx_unique.remove(i)
         if len(scores) == 1:
             scores = scores[0]
+        self.labels_['eog'] = list(eog_idx)
 
-        return eog_idx, scores
+        return self.labels_['eog'], scores
 
-    def apply(self, inst, include=None, exclude=None,
-              n_pca_components=None, start=None, stop=None,
-              copy=False):
+    def apply(self, inst, include=None, exclude=None, n_pca_components=None,
+              start=None, stop=None):
         """Remove selected components from the signal.
 
         Given the unmixing matrix, transform data,
@@ -1043,10 +1110,10 @@ class ICA(ContainsMixin):
         inst : instance of Raw, Epochs or Evoked
             The data to be processed.
         include : array_like of int.
-            The indices refering to columns in the ummixing matrix. The
+            The indices referring to columns in the ummixing matrix. The
             components to be kept.
         exclude : array_like of int.
-            The indices refering to columns in the ummixing matrix. The
+            The indices referring to columns in the ummixing matrix. The
             components to be zeroed out.
         n_pca_components : int | float | None
             The number of PCA components to be kept, either absolute (int)
@@ -1058,32 +1125,26 @@ class ICA(ContainsMixin):
         stop : int | float | None
             Last sample to not include. If float, data will be interpreted as
             time in seconds. If None, data will be used to the last sample.
-        copy : bool
-            Whether to return a copy or whether to apply the solution in place.
-            Defaults to False.
         """
         if isinstance(inst, _BaseRaw):
             out = self._apply_raw(raw=inst, include=include,
                                   exclude=exclude,
                                   n_pca_components=n_pca_components,
-                                  start=start, stop=stop, copy=copy)
+                                  start=start, stop=stop)
         elif isinstance(inst, _BaseEpochs):
             out = self._apply_epochs(epochs=inst, include=include,
                                      exclude=exclude,
-                                     n_pca_components=n_pca_components,
-                                     copy=copy)
+                                     n_pca_components=n_pca_components)
         elif isinstance(inst, Evoked):
             out = self._apply_evoked(evoked=inst, include=include,
                                      exclude=exclude,
-                                     n_pca_components=n_pca_components,
-                                     copy=copy)
+                                     n_pca_components=n_pca_components)
         else:
             raise ValueError('Data input must be of Raw, Epochs or Evoked '
                              'type')
         return out
 
-    def _apply_raw(self, raw, include, exclude, n_pca_components, start, stop,
-                   copy=True):
+    def _apply_raw(self, raw, include, exclude, n_pca_components, start, stop):
         """Aux method"""
         if not raw.preload:
             raise ValueError('Raw data must be preloaded to apply ICA')
@@ -1099,21 +1160,17 @@ class ICA(ContainsMixin):
         start, stop = _check_start_stop(raw, start, stop)
 
         picks = pick_types(raw.info, meg=False, include=self.ch_names,
-                           exclude='bads')
+                           exclude='bads', ref_meg=False)
 
         data = raw[picks, start:stop][0]
         data, _ = self._pre_whiten(data, raw.info, picks)
 
         data = self._pick_sources(data, include, exclude)
 
-        if copy is True:
-            raw = raw.copy()
-
         raw[picks, start:stop] = data
         return raw
 
-    def _apply_epochs(self, epochs, include, exclude,
-                      n_pca_components, copy):
+    def _apply_epochs(self, epochs, include, exclude, n_pca_components):
 
         if not epochs.preload:
             raise ValueError('Epochs must be preloaded to apply ICA')
@@ -1137,9 +1194,6 @@ class ICA(ContainsMixin):
         data, _ = self._pre_whiten(data, epochs.info, picks)
         data = self._pick_sources(data, include=include, exclude=exclude)
 
-        if copy is True:
-            epochs = epochs.copy()
-
         # restore epochs, channels, tsl order
         epochs._data[:, picks] = np.array(np.split(data,
                                           len(epochs.events), 1))
@@ -1147,8 +1201,7 @@ class ICA(ContainsMixin):
 
         return epochs
 
-    def _apply_evoked(self, evoked, include, exclude,
-                      n_pca_components, copy):
+    def _apply_evoked(self, evoked, include, exclude, n_pca_components):
 
         picks = pick_types(evoked.info, meg=False, ref_meg=False,
                            include=self.ch_names,
@@ -1169,9 +1222,6 @@ class ICA(ContainsMixin):
         data, _ = self._pre_whiten(data, evoked.info, picks)
         data = self._pick_sources(data, include=include,
                                   exclude=exclude)
-
-        if copy is True:
-            evoked = evoked.copy()
 
         # restore evoked
         evoked.data[picks] = data
@@ -1199,28 +1249,30 @@ class ICA(ContainsMixin):
         if self.pca_mean_ is not None:
             data -= self.pca_mean_[:, None]
 
-        pca_data = fast_dot(self.pca_components_, data)
-        # Apply unmixing to low dimension PCA
-        sources = fast_dot(self.unmixing_matrix_, pca_data[:n_components])
-
+        sel_keep = np.arange(n_components)
         if include not in (None, []):
-            mask = np.ones(len(sources), dtype=np.bool)
-            mask[np.unique(include)] = False
-            sources[mask] = 0.
-            logger.info('Zeroing out %i ICA components' % mask.sum())
+            sel_keep = np.unique(include)
         elif exclude not in (None, []):
-            exclude_ = np.unique(exclude)
-            sources[exclude_] = 0.
-            logger.info('Zeroing out %i ICA components' % len(exclude_))
-        logger.info('Inverse transforming to PCA space')
-        pca_data[:n_components] = fast_dot(self.mixing_matrix_, sources)
-        data = fast_dot(self.pca_components_[:n_components].T,
-                        pca_data[:n_components])
-        logger.info('Reconstructing sensor space signals from %i PCA '
-                    'components' % max(_n_pca_comp, n_components))
+            sel_keep = np.setdiff1d(np.arange(n_components), exclude)
+
+        logger.info('Zeroing out %i ICA components'
+                    % (n_components - len(sel_keep)))
+
+        unmixing = np.eye(_n_pca_comp)
+        unmixing[:n_components, :n_components] = self.unmixing_matrix_
+        unmixing = np.dot(unmixing, self.pca_components_[:_n_pca_comp])
+
+        mixing = np.eye(_n_pca_comp)
+        mixing[:n_components, :n_components] = self.mixing_matrix_
+        mixing = np.dot(self.pca_components_[:_n_pca_comp].T, mixing)
+
         if _n_pca_comp > n_components:
-            data += fast_dot(self.pca_components_[n_components:_n_pca_comp].T,
-                             pca_data[n_components:_n_pca_comp])
+            sel_keep = np.concatenate(
+                (sel_keep, range(n_components, _n_pca_comp)))
+
+        proj_mat = np.dot(mixing[:, sel_keep], unmixing[sel_keep, :])
+
+        data = fast_dot(proj_mat, data)
 
         if self.pca_mean_ is not None:
             data += self.pca_mean_[:, None]
@@ -1253,12 +1305,22 @@ class ICA(ContainsMixin):
 
         try:
             _write_ica(fid, self)
-        except Exception as inst:
+        except Exception:
             os.remove(fname)
-            raise inst
+            raise
         end_file(fid)
 
         return self
+
+    def copy(self):
+        """Copy the ICA object
+
+        Returns
+        -------
+        ica : instance of ICA
+            The copied object.
+        """
+        return deepcopy(self)
 
     def plot_components(self, picks=None, ch_type=None, res=64, layout=None,
                         vmin=None, vmax=None, cmap='RdBu_r', sensors=True,
@@ -1274,7 +1336,8 @@ class ICA(ContainsMixin):
         ch_type : 'mag' | 'grad' | 'planar1' | 'planar2' | 'eeg' | None
             The channel type to plot. For 'grad', the gradiometers are
             collected in pairs and the RMS for each pair is plotted.
-            If None, then channels are chosen in the order given above.
+            If None, then first available channel type from order given
+            above is used. Defaults to None.
         res : int
             The resolution of the topomap image (n pixels along each side).
         layout : None | Layout
@@ -1290,8 +1353,20 @@ class ICA(ContainsMixin):
             If None, the maximum absolute value is used. If vmin is None,
             but vmax is not, defaults to np.min(data).
             If callable, the output equals vmax(data).
-        cmap : matplotlib colormap
-            Colormap.
+        cmap : matplotlib colormap | (colormap, bool) | 'interactive' | None
+            Colormap to use. If tuple, the first value indicates the colormap
+            to use and the second value is a boolean defining interactivity. In
+            interactive mode the colors are adjustable by clicking and dragging
+            the colorbar with left and right mouse button. Left mouse button
+            moves the scale up and down and right mouse button adjusts the
+            range. Hitting space bar resets the range. Up and down arrows can
+            be used to change the colormap. If None, 'Reds' is used for all
+            positive data, otherwise defaults to 'RdBu_r'. If 'interactive',
+            translates to (None, True). Defaults to 'RdBu_r'.
+
+            .. warning::  Interactive mode works smoothly only for a small
+                amount of topomaps.
+
         sensors : bool | str
             Add markers for sensor locations to the plot. Accepts matplotlib
             plot format string (e.g., 'r+' for red plusses). If True, a circle
@@ -1302,11 +1377,17 @@ class ICA(ContainsMixin):
             Title to use.
         show : bool
             Call pyplot.show() at the end.
-        outlines : 'head' | dict | None
-            The outlines to be drawn. If 'head', a head scheme will be drawn.
-            If dict, each key refers to a tuple of x and y positions. The
-            values in 'mask_pos' will serve as image mask. If None,
-            nothing will be drawn. Defaults to 'head'.
+        outlines : 'head' | 'skirt' | dict | None
+            The outlines to be drawn. If 'head', the default head scheme will
+            be drawn. If 'skirt' the head scheme will be drawn, but sensors are
+            allowed to be plotted outside of the head circle. If dict, each key
+            refers to a tuple of x and y positions, the values in 'mask_pos'
+            will serve as image mask, and the 'autoshrink' (bool) field will
+            trigger automated shrinking of the positions due to points outside
+            the outline. Alternatively, a matplotlib patch object can be passed
+            for advanced masking options, either directly or as a function that
+            returns patches (required for multi-axis plots). If None, nothing
+            will be drawn. Defaults to 'head'.
         contours : int | False | None
             The number of contour lines to draw. If 0, no contours will
             be drawn.
@@ -1324,15 +1405,65 @@ class ICA(ContainsMixin):
         fig : instance of matplotlib.pyplot.Figure
             The figure object.
         """
-        return plot_ica_components(self, picks=picks,
-                                   ch_type=ch_type,
-                                   res=res, layout=layout, vmax=vmax,
-                                   cmap=cmap,
-                                   sensors=sensors, colorbar=colorbar,
-                                   title=title, show=show,
+        return plot_ica_components(self, picks=picks, ch_type=ch_type,
+                                   res=res, layout=layout, vmin=vmin,
+                                   vmax=vmax, cmap=cmap, sensors=sensors,
+                                   colorbar=colorbar, title=title, show=show,
                                    outlines=outlines, contours=contours,
                                    image_interp=image_interp,
                                    head_pos=head_pos)
+
+    def plot_properties(self, inst, picks=None, axes=None, dB=True,
+                        plot_std=True, topomap_args=None, image_args=None,
+                        psd_args=None, figsize=None, show=True):
+        """Display component properties: topography, epochs image, ERP,
+        power spectrum and epoch variance.
+
+        Parameters
+        ----------
+        inst: instance of Epochs or Raw
+            The data to use in plotting properties.
+        picks : int | array-like of int | None
+            The components to be displayed. If None, plot will show the first
+            five sources. If more than one components were chosen in the picks,
+            each one will be plotted in a separate figure. Defaults to None.
+        axes: list of matplotlib axes | None
+            List of five matplotlib axes to use in plotting: [topo_axis,
+            image_axis, erp_axis, spectrum_axis, variance_axis]. If None a new
+            figure with relevant axes is created. Defaults to None.
+        dB: bool
+            Whether to plot spectrum in dB. Defaults to True.
+        plot_std: bool | float
+            Whether to plot standard deviation in ERP/ERF and spectrum plots.
+            Defaults to True, which plots one standard deviation above/below.
+            If set to float allows to control how many standard deviations are
+            plotted. For example 2.5 will plot 2.5 standard deviation
+            above/below.
+        topomap_args : dict | None
+            Dictionary of arguments to ``plot_topomap``. If None, doesn't pass
+            any additional arguments. Defaults to None.
+        image_args : dict | None
+            Dictionary of arguments to ``plot_epochs_image``. If None, doesn't
+            pass any additional arguments. Defaults to None.
+        psd_args : dict | None
+            Dictionary of arguments to ``psd_multitaper``. If None, doesn't
+            pass any additional arguments. Defaults to None.
+        figsize : array-like of size (2,) | None
+            Allows to control size of the figure. If None the figure size
+            defauls to [7., 6.].
+        show : bool
+            Show figure if True.
+
+        Returns
+        -------
+        fig : list
+            List of matplotlib figures.
+        """
+        return plot_ica_properties(inst, self, picks=picks, axes=axes,
+                                   dB=dB, plot_std=plot_std,
+                                   topomap_args=topomap_args,
+                                   image_args=image_args, psd_args=psd_args,
+                                   figsize=figsize, show=show)
 
     def plot_sources(self, inst, picks=None, exclude=None, start=None,
                      stop=None, title=None, show=True, block=False):
@@ -1390,7 +1521,7 @@ class ICA(ContainsMixin):
                                 title=title, start=start, stop=stop, show=show,
                                 block=block)
 
-    def plot_scores(self, scores, exclude=None, axhline=None,
+    def plot_scores(self, scores, exclude=None, labels=None, axhline=None,
                     title='ICA component scores', figsize=(12, 6),
                     show=True):
         """Plot scores related to detected components.
@@ -1405,6 +1536,12 @@ class ICA(ContainsMixin):
         exclude : array_like of int
             The components marked for exclusion. If None (default), ICA.exclude
             will be used.
+        labels : str | list | 'ecg' | 'eog' | None
+            The labels to consider for the axes tests. Defaults to None.
+            If list, should match the outer shape of `scores`.
+            If 'ecg' or 'eog', the ``labels_`` attributes will be looked up.
+            Note that '/' is used internally for sublabels specifying ECG and
+            EOG channels.
         axhline : float
             Draw horizontal line to e.g. visualize rejection threshold.
         title : str
@@ -1419,9 +1556,9 @@ class ICA(ContainsMixin):
         fig : instance of matplotlib.pyplot.Figure
             The figure object.
         """
-        return plot_ica_scores(ica=self, scores=scores, exclude=exclude,
-                               axhline=axhline, title=title,
-                               figsize=figsize, show=show)
+        return plot_ica_scores(
+            ica=self, scores=scores, exclude=exclude, labels=labels,
+            axhline=axhline, title=title, figsize=figsize, show=show)
 
     def plot_overlay(self, inst, exclude=None, picks=None, start=None,
                      stop=None, title=None, show=True):
@@ -1712,16 +1849,24 @@ def _find_sources(sources, target, score_func):
 def _serialize(dict_, outer_sep=';', inner_sep=':'):
     """Aux function"""
     s = []
-    for k, v in dict_.items():
-        if callable(v):
-            v = v.__name__
-        elif isinstance(v, int):
-            v = int(v)
-        for cls in (np.random.RandomState, Covariance):
-            if isinstance(v, cls):
-                v = cls.__name__
+    for key, value in dict_.items():
+        if callable(value):
+            value = value.__name__
+        elif isinstance(value, int):
+            value = int(value)
+        elif isinstance(value, dict):
+            # py35 json does not support numpy int64
+            for subkey, subvalue in value.items():
+                if isinstance(subvalue, list):
+                    if len(subvalue) > 0:
+                        if isinstance(subvalue[0], (int, np.integer)):
+                            value[subkey] = [int(i) for i in subvalue]
 
-        s.append(k + inner_sep + json.dumps(v))
+        for cls in (np.random.RandomState, Covariance):
+            if isinstance(value, cls):
+                value = cls.__name__
+
+        s.append(key + inner_sep + json.dumps(value))
 
     return outer_sep.join(s)
 
@@ -1730,7 +1875,7 @@ def _deserialize(str_, outer_sep=';', inner_sep=':'):
     """Aux Function"""
     out = {}
     for mapping in str_.split(outer_sep):
-        k, v = mapping.split(inner_sep)
+        k, v = mapping.split(inner_sep, 1)
         vv = json.loads(v)
         out[k] = vv if not isinstance(vv, text_type) else str(vv)
 
@@ -1763,7 +1908,7 @@ def _write_ica(fid, ica):
         write_meas_info(fid, ica.info)
         end_block(fid, FIFF.FIFFB_MEAS)
 
-    start_block(fid, FIFF.FIFFB_ICA)
+    start_block(fid, FIFF.FIFFB_MNE_ICA)
 
     #   ICA interface params
     write_string(fid, FIFF.FIFF_MNE_ICA_INTERFACE_PARAMS,
@@ -1774,8 +1919,11 @@ def _write_ica(fid, ica):
         write_name_list(fid, FIFF.FIFF_MNE_ROW_NAMES, ica.ch_names)
 
     # samples on fit
-    ica_misc = {'n_samples_': getattr(ica, 'n_samples_', None)}
-    #   ICA init params
+    n_samples = getattr(ica, 'n_samples_', None)
+    ica_misc = {'n_samples_': (None if n_samples is None else int(n_samples)),
+                'labels_': getattr(ica, 'labels_', None),
+                'method': getattr(ica, 'method', None)}
+
     write_string(fid, FIFF.FIFF_MNE_ICA_INTERFACE_PARAMS,
                  _serialize(ica_init))
 
@@ -1805,7 +1953,7 @@ def _write_ica(fid, ica):
     write_int(fid, FIFF.FIFF_MNE_ICA_BADS, ica.exclude)
 
     # Done!
-    end_block(fid, FIFF.FIFFB_ICA)
+    end_block(fid, FIFF.FIFFB_MNE_ICA)
 
 
 @verbose
@@ -1829,18 +1977,22 @@ def read_ica(fname):
     fid, tree, _ = fiff_open(fname)
 
     try:
-        info, meas = read_meas_info(fid, tree)
-        info['filename'] = fname
+        # we used to store bads that weren't part of the info...
+        info, meas = read_meas_info(fid, tree, clean_bads=True)
     except ValueError:
         logger.info('Could not find the measurement info. \n'
                     'Functionality requiring the info won\'t be'
                     ' available.')
         info = None
+    else:
+        info['filename'] = fname
 
-    ica_data = dir_tree_find(tree, FIFF.FIFFB_ICA)
+    ica_data = dir_tree_find(tree, FIFF.FIFFB_MNE_ICA)
     if len(ica_data) == 0:
-        fid.close()
-        raise ValueError('Could not find ICA data')
+        ica_data = dir_tree_find(tree, 123)  # Constant 123 Used before v 0.11
+        if len(ica_data) == 0:
+            fid.close()
+            raise ValueError('Could not find ICA data')
 
     my_ica_data = ica_data[0]
     for d in my_ica_data['directory']:
@@ -1888,7 +2040,7 @@ def read_ica(fname):
         return x.astype(np.float64)
 
     ica_init = dict((k, v) for k, v in ica_init.items()
-                    if k in getargspec(ICA.__init__).args)
+                    if k in _get_args(ICA.__init__))
     ica = ICA(**ica_init)
     ica.current_fit = current_fit
     ica.ch_names = ch_names.split(':')
@@ -1903,6 +2055,10 @@ def read_ica(fname):
     ica.info = info
     if 'n_samples_' in ica_misc:
         ica.n_samples_ = ica_misc['n_samples_']
+    if 'labels_' in ica_misc:
+        ica.labels_ = ica_misc['labels_']
+    if 'method' in ica_misc:
+        ica.method = ica_misc['method']
 
     logger.info('Ready.')
 
@@ -2113,7 +2269,7 @@ def run_ica(raw, n_components, max_pca_components=100,
                       ecg_score_func=ecg_score_func,
                       ecg_criterion=ecg_criterion, eog_ch=eog_ch,
                       eog_score_func=eog_score_func,
-                      eog_criterion=ecg_criterion,
+                      eog_criterion=eog_criterion,
                       skew_criterion=skew_criterion,
                       kurt_criterion=kurt_criterion,
                       var_criterion=var_criterion,
@@ -2137,3 +2293,303 @@ def _band_pass_filter(ica, sources, target, l_freq, h_freq, verbose=None):
         raise ValueError('Must specify both pass bands')
 
     return sources, target
+
+
+# #############################################################################
+# CORRMAP
+
+def _get_ica_map(ica, components=None):
+    """Get ICA topomap for components"""
+    fast_dot = _get_fast_dot()
+    if components is None:
+        components = list(range(ica.n_components_))
+    maps = fast_dot(ica.mixing_matrix_[:, components].T,
+                    ica.pca_components_[:ica.n_components_])
+    return maps
+
+
+def _find_max_corrs(all_maps, target, threshold):
+    """Compute correlations between template and target components"""
+    all_corrs = [compute_corr(target, subj.T) for subj in all_maps]
+    abs_corrs = [np.abs(a) for a in all_corrs]
+    corr_polarities = [np.sign(a) for a in all_corrs]
+
+    if threshold <= 1:
+        max_corrs = [list(np.nonzero(s_corr > threshold)[0])
+                     for s_corr in abs_corrs]
+    else:
+        max_corrs = [list(find_outliers(s_corr, threshold=threshold))
+                     for s_corr in abs_corrs]
+
+    am = [l[i] for l, i_s in zip(abs_corrs, max_corrs)
+          for i in i_s]
+    median_corr_with_target = np.median(am) if len(am) > 0 else 0
+
+    polarities = [l[i] for l, i_s in zip(corr_polarities, max_corrs)
+                  for i in i_s]
+
+    maxmaps = [l[i] for l, i_s in zip(all_maps, max_corrs)
+               for i in i_s]
+
+    if len(maxmaps) == 0:
+        return [], 0, 0, []
+    newtarget = np.zeros(maxmaps[0].size)
+    std_of_maps = np.std(np.asarray(maxmaps))
+    mean_of_maps = np.std(np.asarray(maxmaps))
+    for maxmap, polarity in zip(maxmaps, polarities):
+        newtarget += (maxmap / std_of_maps - mean_of_maps) * polarity
+
+    newtarget /= len(maxmaps)
+    newtarget *= std_of_maps
+
+    sim_i_o = np.abs(np.corrcoef(target, newtarget)[1, 0])
+
+    return newtarget, median_corr_with_target, sim_i_o, max_corrs
+
+
+def _plot_corrmap(data, subjs, indices, ch_type, ica, label, show, outlines,
+                  layout, cmap, contours, template=True):
+    """Customized ica.plot_components for corrmap"""
+    if not template:
+        title = 'Detected components'
+        if label is not None:
+            title += ' of type ' + label
+    else:
+        title = "Supplied template"
+
+    picks = list(range(len(data)))
+
+    p = 20
+    if len(picks) > p:  # plot components by sets of 20
+        n_components = len(picks)
+        figs = [_plot_corrmap(data[k:k + p], subjs[k:k + p],
+                indices[k:k + p], ch_type, ica, label, show,
+                outlines=outlines, layout=layout, cmap=cmap,
+                contours=contours)
+                for k in range(0, n_components, p)]
+        return figs
+    elif np.isscalar(picks):
+        picks = [picks]
+
+    data_picks, pos, merge_grads, names, _ = _prepare_topo_plot(
+        ica, ch_type, layout)
+    pos, outlines = _check_outlines(pos, outlines)
+
+    data = np.atleast_2d(data)
+    data = data[:, data_picks]
+
+    # prepare data for iteration
+    fig, axes = _prepare_trellis(len(picks), max_col=5)
+    fig.suptitle(title)
+
+    if merge_grads:
+        from ..channels.layout import _merge_grad_data
+    for ii, data_, ax, subject, idx in zip(picks, data, axes, subjs, indices):
+        if template:
+            ttl = 'Subj. {0}, IC {1}'.format(subject, idx)
+            ax.set_title(ttl, fontsize=12)
+        data_ = _merge_grad_data(data_) if merge_grads else data_
+        vmin_, vmax_ = _setup_vmin_vmax(data_, None, None)
+        plot_topomap(data_.flatten(), pos, vmin=vmin_, vmax=vmax_,
+                     res=64, axes=ax, cmap=cmap, outlines=outlines,
+                     image_mask=None, contours=contours, show=False,
+                     image_interp='bilinear')[0]
+        _hide_frame(ax)
+    tight_layout(fig=fig)
+    fig.subplots_adjust(top=0.8)
+    fig.canvas.draw()
+    plt_show(show)
+    return fig
+
+
+@verbose
+def corrmap(icas, template, threshold="auto", label=None, ch_type="eeg",
+            plot=True, show=True, verbose=None, outlines='head', layout=None,
+            sensors=True, contours=6, cmap=None):
+    """Find similar Independent Components across subjects by map similarity.
+
+    Corrmap (Viola et al. 2009 Clin Neurophysiol) identifies the best group
+    match to a supplied template. Typically, feed it a list of fitted ICAs and
+    a template IC, for example, the blink for the first subject, to identify
+    specific ICs across subjects.
+
+    The specific procedure consists of two iterations. In a first step, the
+    maps best correlating with the template are identified. In the step, the
+    analysis is repeated with the mean of the maps identified in the first
+    stage.
+
+    Run with `plot` and `show` set to `True` and `label=False` to find
+    good parameters. Then, run with labelling enabled to apply the
+    labelling in the IC objects. (Running with both `plot` and `labels`
+    off does nothing.)
+
+    Outputs a list of fitted ICAs with the indices of the marked ICs in a
+    specified field.
+
+    The original Corrmap website: www.debener.de/corrmap/corrmapplugin1.html
+
+    Parameters
+    ----------
+    icas : list of mne.preprocessing.ICA
+        A list of fitted ICA objects.
+    template : tuple | np.ndarray, shape (n_components,)
+        Either a tuple with two elements (int, int) representing the list
+        indices of the set from which the template should be chosen, and the
+        template. E.g., if template=(1, 0), the first IC of the 2nd ICA object
+        is used.
+        Or a numpy array whose size corresponds to each IC map from the
+        supplied maps, in which case this map is chosen as the template.
+    threshold : "auto" | list of float | float
+        Correlation threshold for identifying ICs
+        If "auto", search for the best map by trying all correlations between
+        0.6 and 0.95. In the original proposal, lower values are considered,
+        but this is not yet implemented.
+        If list of floats, search for the best map in the specified range of
+        correlation strengths. As correlation values, must be between 0 and 1
+        If float > 0, select ICs correlating better than this.
+        If float > 1, use find_outliers to identify ICs within subjects (not in
+        original Corrmap)
+        Defaults to "auto".
+    label : None | str
+        If not None, categorised ICs are stored in a dictionary "labels_" under
+        the given name. Preexisting entries will be appended to (excluding
+        repeats), not overwritten. If None, a dry run is performed and
+        the supplied ICs are not changed.
+    ch_type : 'mag' | 'grad' | 'planar1' | 'planar2' | 'eeg'
+            The channel type to plot. Defaults to 'eeg'.
+    plot : bool
+        Should constructed template and selected maps be plotted? Defaults
+        to True.
+    show : bool
+        Show figures if True.
+    layout : None | Layout | list of Layout
+        Layout instance specifying sensor positions (does not need to be
+        specified for Neuromag data). Or a list of Layout if projections
+        are from different sensor types.
+    cmap : None | matplotlib colormap
+        Colormap for the plot. If ``None``, defaults to 'Reds_r' for norm data,
+        otherwise to 'RdBu_r'.
+    sensors : bool | str
+        Add markers for sensor locations to the plot. Accepts matplotlib plot
+        format string (e.g., 'r+' for red plusses). If True, a circle will be
+        used (via .add_artist). Defaults to True.
+    outlines : 'head' | dict | None
+        The outlines to be drawn. If 'head', a head scheme will be drawn. If
+        dict, each key refers to a tuple of x and y positions. The values in
+        'mask_pos' will serve as image mask. If None, nothing will be drawn.
+        Defaults to 'head'. If dict, the 'autoshrink' (bool) field will
+        trigger automated shrinking of the positions due to points outside the
+        outline. Moreover, a matplotlib patch object can be passed for
+        advanced masking options, either directly or as a function that returns
+        patches (required for multi-axis plots).
+    contours : int | False | None
+        The number of contour lines to draw. If 0, no contours will be drawn.
+    verbose : bool, str, int, or None
+        If not None, override default verbose level (see mne.verbose).
+
+    Returns
+    -------
+    template_fig : fig
+        Figure showing the template.
+    labelled_ics : fig
+        Figure showing the labelled ICs in all ICA decompositions.
+    """
+    if not isinstance(plot, bool):
+        raise ValueError("`plot` must be of type `bool`")
+
+    if threshold == 'auto':
+        threshold = np.arange(60, 95, dtype=np.float64) / 100.
+
+    all_maps = [_get_ica_map(ica) for ica in icas]
+
+    # check if template is an index to one IC in one ICA object, or an array
+    if len(template) == 2:
+        target = all_maps[template[0]][template[1]]
+        is_subject = True
+    elif template.ndim == 1 and len(template) == all_maps[0].shape[1]:
+        target = template
+        is_subject = False
+    else:
+        raise ValueError("`template` must be a length-2 tuple or an array the "
+                         "size of the ICA maps.")
+
+    template_fig, labelled_ics = None, None
+    if plot is True:
+        if is_subject:  # plotting from an ICA object
+            ttl = 'Template from subj. {0}'.format(str(template[0]))
+            template_fig = icas[template[0]].plot_components(
+                picks=template[1], ch_type=ch_type, title=ttl,
+                outlines=outlines, cmap=cmap, contours=contours, layout=layout,
+                show=show)
+        else:  # plotting an array
+            template_fig = _plot_corrmap([template], [0], [0], ch_type,
+                                         icas[0].copy(), "Template",
+                                         outlines=outlines, cmap=cmap,
+                                         contours=contours, layout=layout,
+                                         show=show, template=True)
+        template_fig.subplots_adjust(top=0.8)
+        template_fig.canvas.draw()
+
+    # first run: use user-selected map
+    if isinstance(threshold, (int, float)):
+        if len(all_maps) == 0:
+            logger.info('No component detected using find_outliers.'
+                        ' Consider using threshold="auto"')
+            return icas
+        nt, mt, s, mx = _find_max_corrs(all_maps, target, threshold)
+    elif len(threshold) > 1:
+        paths = [_find_max_corrs(all_maps, target, t) for t in threshold]
+        # find iteration with highest avg correlation with target
+        nt, mt, s, mx = paths[np.argmax([path[2] for path in paths])]
+
+    # second run: use output from first run
+    if isinstance(threshold, (int, float)):
+        if len(all_maps) == 0 or len(nt) == 0:
+            if threshold > 1:
+                logger.info('No component detected using find_outliers. '
+                            'Consider using threshold="auto"')
+            return icas
+        nt, mt, s, mx = _find_max_corrs(all_maps, nt, threshold)
+    elif len(threshold) > 1:
+        paths = [_find_max_corrs(all_maps, nt, t) for t in threshold]
+        # find iteration with highest avg correlation with target
+        nt, mt, s, mx = paths[np.argmax([path[1] for path in paths])]
+
+    allmaps, indices, subjs, nones = [list() for _ in range(4)]
+    logger.info('Median correlation with constructed map: %0.3f' % mt)
+    if plot is True:
+        logger.info('Displaying selected ICs per subject.')
+
+    for ii, (ica, max_corr) in enumerate(zip(icas, mx)):
+        if (label is not None) and (not hasattr(ica, 'labels_')):
+            ica.labels_ = dict()
+        if len(max_corr) > 0:
+            if isinstance(max_corr[0], np.ndarray):
+                max_corr = max_corr[0]
+            if label is not None:
+                ica.labels_[label] = list(set(list(max_corr) +
+                                          ica.labels_.get(label, list())))
+            if plot is True:
+                allmaps.extend(_get_ica_map(ica, components=max_corr))
+                subjs.extend([ii] * len(max_corr))
+                indices.extend(max_corr)
+        else:
+            if (label is not None) and (label not in ica.labels_):
+                ica.labels_[label] = list()
+            nones.append(ii)
+
+    if len(nones) == 0:
+        logger.info('At least 1 IC detected for each subject.')
+    else:
+        logger.info('No maps selected for subject(s) ' +
+                    ', '.join([str(x) for x in nones]) +
+                    ', consider a more liberal threshold.')
+
+    if plot is True:
+        labelled_ics = _plot_corrmap(allmaps, subjs, indices, ch_type, ica,
+                                     label, outlines=outlines, cmap=cmap,
+                                     contours=contours, layout=layout,
+                                     show=show)
+        return template_fig, labelled_ics
+    else:
+        return None

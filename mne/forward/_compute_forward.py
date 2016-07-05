@@ -37,10 +37,10 @@ def _dup_coil_set(coils, coord_frame, t):
     if t is not None:
         coord_frame = t['to']
         for coil in coils:
+            for key in ('ex', 'ey', 'ez'):
+                if key in coil:
+                    coil[key] = apply_trans(t['trans'], coil[key], False)
             coil['r0'] = apply_trans(t['trans'], coil['r0'])
-            coil['ex'] = apply_trans(t['trans'], coil['ex'], False)
-            coil['ey'] = apply_trans(t['trans'], coil['ey'], False)
-            coil['ez'] = apply_trans(t['trans'], coil['ez'], False)
             coil['rmag'] = apply_trans(t['trans'], coil['rmag'])
             coil['cosmag'] = apply_trans(t['trans'], coil['cosmag'], False)
             coil['coord_frame'] = t['to']
@@ -59,7 +59,7 @@ def _check_coil_frame(coils, coord_frame, bem):
     return coils, coord_frame
 
 
-def _lin_field_coeff(surf, mult, rmags, cosmags, ws, n_int, n_jobs):
+def _lin_field_coeff(surf, mult, rmags, cosmags, ws, bins, n_jobs):
     """Parallel wrapper for _do_lin_field_coeff to compute linear coefficients.
 
     Parameters
@@ -73,10 +73,10 @@ def _lin_field_coeff(surf, mult, rmags, cosmags, ws, n_int, n_jobs):
         3D positions of MEG coil integration points (from coil['rmag'])
     cosmag : ndarray, shape (n_integration_pts, 3)
         Direction of the MEG coil integration points (from coil['cosmag'])
-    ws : ndarray, shape (n_sensor_pts,)
+    ws : ndarray, shape (n_integration_pts,)
         Weights for MEG coil integration points
-    n_int : ndarray, shape (n_MEG_sensors,)
-        Number of integration points for each MEG sensor
+    bins : ndarray, shape (n_integration_points,)
+        The sensor assignments for each rmag/cosmag/w.
     n_jobs : int
         Number of jobs to run in parallel
 
@@ -88,14 +88,14 @@ def _lin_field_coeff(surf, mult, rmags, cosmags, ws, n_int, n_jobs):
     """
     parallel, p_fun, _ = parallel_func(_do_lin_field_coeff, n_jobs)
     nas = np.array_split
-    coeffs = parallel(p_fun(surf['rr'], t, tn, ta, rmags, cosmags, ws, n_int)
+    coeffs = parallel(p_fun(surf['rr'], t, tn, ta, rmags, cosmags, ws, bins)
                       for t, tn, ta in zip(nas(surf['tris'], n_jobs),
                                            nas(surf['tri_nn'], n_jobs),
                                            nas(surf['tri_area'], n_jobs)))
     return mult * np.sum(coeffs, axis=0)
 
 
-def _do_lin_field_coeff(bem_rr, tris, tn, ta, rmags, cosmags, ws, n_int):
+def _do_lin_field_coeff(bem_rr, tris, tn, ta, rmags, cosmags, ws, bins):
     """Compute field coefficients (parallel-friendly).
 
     See section IV of Mosher et al., 1999 (specifically equation 35).
@@ -117,16 +117,15 @@ def _do_lin_field_coeff(bem_rr, tris, tn, ta, rmags, cosmags, ws, n_int):
         Direction of the MEG coil integration points (from coil['cosmag'])
     ws : ndarray, shape (n_sensor_pts,)
         Weights for MEG coil integration points
-    n_int : ndarray, shape (n_MEG_sensors,)
-        Number of integration points for each MEG sensor
+    bins : ndarray, shape (n_sensor_pts,)
+        The sensor assignments for each rmag/cosmag/w.
 
     Returns
     -------
     coeff : ndarray, shape (n_MEG_sensors, n_BEM_vertices)
         Linear coefficients with effect of each BEM vertex on each sensor (?)
     """
-    coeff = np.zeros((len(n_int), len(bem_rr)))
-    bins = np.repeat(np.arange(len(n_int)), n_int)
+    coeff = np.zeros((bins[-1] + 1, len(bem_rr)))
     for tri, tri_nn, tri_area in zip(tris, tn, ta):
         # Accumulate the coefficients for each triangle node and add to the
         # corresponding coefficient matrix
@@ -147,7 +146,7 @@ def _do_lin_field_coeff(bem_rr, tris, tn, ta, rmags, cosmags, ws, n_int):
             c = fast_cross_3d(diff, tri_nn[np.newaxis, :])
             x = tri_area * np.sum(c * cosmags, axis=1) / \
                 (3.0 * dl * np.sqrt(dl))
-            zz += [np.bincount(bins, weights=x * ws, minlength=len(n_int))]
+            zz += [np.bincount(bins, weights=x * ws, minlength=bins[-1] + 1)]
         coeff[:, tri] += np.array(zz).T
     return coeff
 
@@ -158,7 +157,13 @@ def _concatenate_coils(coils):
     cosmags = np.concatenate([coil['cosmag'] for coil in coils])
     ws = np.concatenate([coil['w'] for coil in coils])
     n_int = np.array([len(coil['rmag']) for coil in coils])
-    return rmags, cosmags, ws, n_int
+    if n_int[-1] == 0:
+        # We assume each sensor has at least one integration point,
+        # which should be a safe assumption. But let's check it here, since
+        # our code elsewhere relies on bins[-1] + 1 being the number of sensors
+        raise RuntimeError('not supported')
+    bins = np.repeat(np.arange(len(n_int)), n_int)
+    return rmags, cosmags, ws, bins
 
 
 def _bem_specify_coils(bem, coils, coord_frame, mults, n_jobs):
@@ -193,17 +198,19 @@ def _bem_specify_coils(bem, coils, coord_frame, mults, n_jobs):
     # potential approximation
 
     # Process each of the surfaces
-    rmags, cosmags, ws, n_int = _concatenate_coils(coils)
+    rmags, cosmags, ws, bins = _concatenate_coils(coils)
     lens = np.cumsum(np.r_[0, [len(s['rr']) for s in bem['surfs']]])
-    coeff = np.empty((len(n_int), lens[-1]))  # shape(n_coils, n_BEM_verts)
+    sol = np.zeros((bins[-1] + 1, bem['solution'].shape[1]))
 
+    lims = np.concatenate([np.arange(0, sol.shape[0], 100), [sol.shape[0]]])
     # Compute coeffs for each surface, one at a time
     for o1, o2, surf, mult in zip(lens[:-1], lens[1:],
                                   bem['surfs'], bem['field_mult']):
-        coeff[:, o1:o2] = _lin_field_coeff(surf, mult, rmags, cosmags, ws,
-                                           n_int, n_jobs)
-    # put through the bem
-    sol = np.dot(coeff, bem['solution'])
+        coeff = _lin_field_coeff(surf, mult, rmags, cosmags, ws, bins, n_jobs)
+        # put through the bem (in chunks to save memory)
+        for start, stop in zip(lims[:-1], lims[1:]):
+            sol[start:stop] += np.dot(coeff[start:stop],
+                                      bem['solution'][o1:o2])
     sol *= mults
     return sol
 
@@ -404,7 +411,7 @@ def _bem_pot_or_field(rr, mri_rr, mri_Q, coils, solution, bem_rr, n_jobs,
     Returns
     -------
     B : ndarray, shape (n_dipoles * 3, n_sensors)
-        Foward solution for a set of sensors
+        Forward solution for a set of sensors
     """
     # Both MEG and EEG have the inifinite-medium potentials
     # This could be just vectorized, but eats too much memory, so instead we
@@ -472,7 +479,7 @@ def _do_inf_pots(mri_rr, bem_rr, mri_Q, sol):
     Returns
     -------
     B : ndarray, (n_dipoles * 3, n_sensors)
-        Foward solution for sensors due to volume currents
+        Forward solution for sensors due to volume currents
     """
 
     # Doing work of 'fwd_bem_pot_calc' in MNE-C
@@ -482,7 +489,7 @@ def _do_inf_pots(mri_rr, bem_rr, mri_Q, sol):
     # B = np.dot(v0s, sol)
 
     # We chunk the source mri_rr's in order to save memory
-    bounds = np.r_[np.arange(0, len(mri_rr), 1000), len(mri_rr)]
+    bounds = np.concatenate([np.arange(0, len(mri_rr), 200), [len(mri_rr)]])
     B = np.empty((len(mri_rr) * 3, sol.shape[1]))
     for bi in range(len(bounds) - 1):
         # v0 in Hamalainen et al., 1989 == v_inf in Mosher, et al., 1999
@@ -514,8 +521,7 @@ def _sphere_field(rrs, coils, sphere):
     The formulas have been manipulated for efficient computation
     by Matti Hamalainen, February 1990
     """
-    rmags, cosmags, ws, n_int = _concatenate_coils(coils)
-    bins = np.repeat(np.arange(len(n_int)), n_int)
+    rmags, cosmags, ws, bins = _concatenate_coils(coils)
 
     # Shift to the sphere model coordinates
     rrs = rrs - sphere['r0']
@@ -546,8 +552,7 @@ def _sphere_field(rrs, coils, sphere):
         v2 = fast_cross_3d(rr[np.newaxis, :], this_poss)
         xx = ((good * ws)[:, np.newaxis] *
               (v1 / F[:, np.newaxis] + v2 * g[:, np.newaxis]))
-        zz = np.array([np.bincount(bins, weights=x,
-                                   minlength=len(n_int)) for x in xx.T])
+        zz = np.array([np.bincount(bins, x, bins[-1] + 1) for x in xx.T])
         B[3 * ri:3 * ri + 3, :] = zz
     B *= _MAG_FACTOR
     return B
@@ -555,8 +560,7 @@ def _sphere_field(rrs, coils, sphere):
 
 def _eeg_spherepot_coil(rrs, coils, sphere):
     """Calculate the EEG in the sphere model."""
-    rmags, cosmags, ws, n_int = _concatenate_coils(coils)
-    bins = np.repeat(np.arange(len(n_int)), n_int)
+    rmags, cosmags, ws, bins = _concatenate_coils(coils)
 
     # Shift to the sphere model coordinates
     rrs = rrs - sphere['r0']
@@ -611,8 +615,7 @@ def _eeg_spherepot_coil(rrs, coils, sphere):
 
             # compute total result
             xx = vval_one * ws[:, np.newaxis]
-            zz = np.array([np.bincount(bins, weights=x,
-                                       minlength=len(n_int)) for x in xx.T])
+            zz = np.array([np.bincount(bins, x, bins[-1] + 1) for x in xx.T])
             B[3 * ri:3 * ri + 3, :] = zz
     # finishing by scaling by 1/(4*M_PI)
     B *= 0.25 / np.pi
@@ -624,7 +627,6 @@ def _eeg_spherepot_coil(rrs, coils, sphere):
 
 def _magnetic_dipole_field_vec(rrs, coils):
     """Compute an MEG forward solution for a set of magnetic dipoles."""
-    fwd = np.empty((3 * len(rrs), len(coils)))
     # The code below is a more efficient version (~30x) of this:
     # for ri, rr in enumerate(rrs):
     #     for k in range(len(coils)):
@@ -640,10 +642,12 @@ def _magnetic_dipole_field_vec(rrs, coils):
     #                                   axis=1)[:, np.newaxis] -
     #                 dist2 * this_coil['cosmag']) / dist5
     #         fwd[3*ri:3*ri+3, k] = 1e-7 * np.dot(this_coil['w'], sum_)
-
-    fwd = np.empty((3 * len(rrs), len(coils)))
-    rmags, cosmags, ws, n_int = _concatenate_coils(coils)
-    bins = np.repeat(np.arange(len(n_int)), n_int)
+    if isinstance(coils, tuple):
+        rmags, cosmags, ws, bins = coils
+    else:
+        rmags, cosmags, ws, bins = _concatenate_coils(coils)
+    del coils
+    fwd = np.empty((3 * len(rrs), bins[-1] + 1))
     for ri, rr in enumerate(rrs):
         diff = rmags - rr
         dist2 = np.sum(diff * diff, axis=1)[:, np.newaxis]
@@ -654,8 +658,7 @@ def _magnetic_dipole_field_vec(rrs, coils):
                                                       axis=1)[:, np.newaxis] -
                                     dist2 * cosmags) / (dist2 * dist2 * dist)
         for ii in range(3):
-            fwd[3 * ri + ii] = np.bincount(bins, weights=sum_[:, ii],
-                                           minlength=len(n_int))
+            fwd[3 * ri + ii] = np.bincount(bins, sum_[:, ii], bins[-1] + 1)
     fwd *= 1e-7
     return fwd
 
@@ -678,7 +681,7 @@ def _prep_field_computation(rr, bem, fwd_data, n_jobs, verbose=None):
         Boundary Element Model information
     fwd_data : dict
         Dict containing sensor information. Gets updated here with BEM and
-        sensor information for later foward calculations
+        sensor information for later forward calculations
     n_jobs : int
         Number of jobs to run in parallel
     verbose : bool, str, int, or None
@@ -798,7 +801,7 @@ def _compute_forwards_meeg(rr, fd, n_jobs, verbose=None):
                     '(free orientations)...'
                     % (coil_type.upper(), len(rr),
                        '' if len(rr) == 1 else 's'))
-        # Calculate foward solution using spherical or BEM model
+        # Calculate forward solution using spherical or BEM model
         B = fun(rr, mri_rr, mri_Q, coils, solution, bem_rr, n_jobs,
                 coil_type)
 

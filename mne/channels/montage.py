@@ -17,8 +17,14 @@ import numpy as np
 from ..viz import plot_montage
 from .channels import _contains_ch_type
 from ..transforms import (_sphere_to_cartesian, apply_trans,
-                          get_ras_to_neuromag_trans)
-from ..io.meas_info import _make_dig_points, _read_dig_points
+                          get_ras_to_neuromag_trans, _topo_to_sphere,
+                          _str_to_frame, _frame_to_str)
+from ..io.meas_info import _make_dig_points, _read_dig_points, _read_dig_fif
+from ..io.pick import pick_types
+from ..io.open import fiff_open
+from ..io.constants import FIFF
+from ..utils import _check_fname, warn
+
 from ..externals.six import string_types
 from ..externals.six.moves import map
 
@@ -51,8 +57,8 @@ class Montage(object):
         self.selection = selection
 
     def __repr__(self):
-        s = '<Montage | %s - %d Channels: %s ...>'
-        s %= self.kind, len(self.ch_names), ', '.join(self.ch_names[:3])
+        s = ('<Montage | %s - %d channels: %s ...>'
+             % (self.kind, len(self.ch_names), ', '.join(self.ch_names[:3])))
         return s
 
     def plot(self, scale_factor=1.5, show_names=False):
@@ -75,22 +81,69 @@ class Montage(object):
 
 
 def read_montage(kind, ch_names=None, path=None, unit='m', transform=False):
-    """Read montage from a file
+    """Read a generic (built-in) montage from a file
+
+    This function can be used to read electrode positions from a user specified
+    file using the `kind` and `path` parameters. Alternatively, use only the
+    `kind` parameter to load one of the built-in montages:
+
+    ===================   =====================================================
+    Kind                  description
+    ===================   =====================================================
+    standard_1005         Electrodes are named and positioned according to the
+                          international 10-05 system.
+    standard_1020         Electrodes are named and positioned according to the
+                          international 10-20 system.
+    standard_alphabetic   Electrodes are named with LETTER-NUMBER combinations
+                          (A1, B2, F4, etc.)
+    standard_postfixed    Electrodes are named according to the international
+                          10-20 system using postfixes for intermediate
+                          positions.
+    standard_prefixed     Electrodes are named according to the international
+                          10-20 system using prefixes for intermediate
+                          positions.
+    standard_primed       Electrodes are named according to the international
+                          10-20 system using prime marks (' and '') for
+                          intermediate positions.
+
+    biosemi16             BioSemi cap with 16 electrodes
+    biosemi32             BioSemi cap with 32 electrodes
+    biosemi64             BioSemi cap with 64 electrodes
+    biosemi128            BioSemi cap with 128 electrodes
+    biosemi160            BioSemi cap with 160 electrodes
+    biosemi256            BioSemi cap with 256 electrodes
+
+    easycap-M10           Brainproducts EasyCap with electrodes named
+                          according to the 10-05 system
+    easycap-M1            Brainproduct EasyCap with numbered electrodes
+
+    EGI_256               Geodesic Sensor Net with 256 channels
+
+    GSN-HydroCel-32       HydroCel Geodesic Sensor Net with 32 electrodes
+    GSN-HydroCel-64_1.0   HydroCel Geodesic Sensor Net with 64 electrodes
+    GSN-HydroCel-65_1.0   HydroCel Geodesic Sensor Net with 64 electrodes + Cz
+    GSN-HydroCel-128      HydroCel Geodesic Sensor Net with 128 electrodes
+    GSN-HydroCel-129      HydroCel Geodesic Sensor Net with 128 electrodes + Cz
+    GSN-HydroCel-256      HydroCel Geodesic Sensor Net with 256 electrodes
+    GSN-HydroCel-257      HydroCel Geodesic Sensor Net with 256 electrodes + Cz
+    ===================   =====================================================
 
     Parameters
     ----------
     kind : str
         The name of the montage file (e.g. kind='easycap-M10' for
         'easycap-M10.txt'). Files with extensions '.elc', '.txt', '.csd',
-        '.elp', '.hpts' or '.sfp' are supported.
+        '.elp', '.hpts', '.sfp' or '.loc' ('.locs' and '.eloc') are supported.
     ch_names : list of str | None
-        The names to read. If None, all names are returned.
+        If not all electrodes defined in the montage are present in the EEG
+        data, use this parameter to select subset of electrode positions to
+        load. If None (default), all defined electrode positions are returned.
     path : str | None
         The path of the folder containing the montage file. Defaults to the
         mne/channels/data/montages folder in your mne-python installation.
     unit : 'm' | 'cm' | 'mm'
-        Unit of the input file. If not 'm', coordinates will be rescaled
-        to 'm'.
+        Unit of the input file. If not 'm' (default), coordinates will be
+        rescaled to 'm'.
     transform : bool
         If True, points will be transformed to Neuromag space.
         The fidicuals, 'nasion', 'lpa', 'rpa' must be specified in
@@ -102,9 +155,16 @@ def read_montage(kind, ch_names=None, path=None, unit='m', transform=False):
     montage : instance of Montage
         The montage.
 
+    See Also
+    --------
+    read_dig_montage : To read subject-specific digitization information.
+
     Notes
     -----
     Built-in montages are not scaled or transformed by default.
+
+    Montages can contain fiducial points in addition to electrode
+    locations, e.g. ``biosemi-64`` contains 67 total channels.
 
     .. versionadded:: 0.9.0
     """
@@ -112,7 +172,8 @@ def read_montage(kind, ch_names=None, path=None, unit='m', transform=False):
     if path is None:
         path = op.join(op.dirname(__file__), 'data', 'montages')
     if not op.isabs(kind):
-        supported = ('.elc', '.txt', '.csd', '.sfp', '.elp', '.hpts')
+        supported = ('.elc', '.txt', '.csd', '.sfp', '.elp', '.hpts', '.loc',
+                     '.locs', '.eloc')
         montages = [op.splitext(f) for f in os.listdir(path)]
         montages = [m for m in montages if m[1] in supported and kind == m[0]]
         if len(montages) != 1:
@@ -207,6 +268,21 @@ def read_montage(kind, ch_names=None, path=None, unit='m', transform=False):
         data = np.loadtxt(fname, dtype=dtype)
         pos = np.vstack((data['x'], data['y'], data['z'])).T
         ch_names_ = data['name'].astype(np.str)
+    elif ext in ('.loc', '.locs', '.eloc'):
+        ch_names_ = np.loadtxt(fname, dtype='S4',
+                               usecols=[3]).astype(np.str).tolist()
+        dtype = {'names': ('angle', 'radius'), 'formats': ('f4', 'f4')}
+        angle, radius = np.loadtxt(fname, dtype=dtype, usecols=[1, 2],
+                                   unpack=True)
+
+        sph_phi, sph_theta = _topo_to_sphere(angle, radius)
+
+        azimuth = sph_theta / 180.0 * np.pi
+        elevation = sph_phi / 180.0 * np.pi
+        r = np.ones((len(ch_names_), ))
+
+        x, y, z = _sphere_to_cartesian(azimuth, elevation, r)
+        pos = np.c_[-y, x, z]
     else:
         raise ValueError('Currently the "%s" template is not supported.' %
                          kind)
@@ -260,32 +336,36 @@ class DigMontage(object):
     Parameters
     ----------
     hsp : array, shape (n_points, 3)
-        The positions of the channels in 3d.
+        The positions of the headshape points in 3d.
+        These points are in the native digitizer space.
     hpi : array, shape (n_hpi, 3)
         The positions of the head-position indicator coils in 3d.
         These points are in the MEG device space.
     elp : array, shape (n_hpi, 3)
         The positions of the head-position indicator coils in 3d.
-        This is typically in the acquisition digitizer space.
+        This is typically in the native digitizer space.
     point_names : list, shape (n_elp)
         The names of the digitized points for hpi and elp.
     nasion : array, shape (1, 3)
-        The position of the nasion fidicual point in the RAS head space.
+        The position of the nasion fidicual point.
     lpa : array, shape (1, 3)
-        The position of the left periauricular fidicual point in
-        the RAS head space.
+        The position of the left periauricular fidicual point.
     rpa : array, shape (1, 3)
-        The position of the right periauricular fidicual point in
-        the RAS head space.
+        The position of the right periauricular fidicual point.
     dev_head_t : array, shape (4, 4)
         A Device-to-Head transformation matrix.
+    dig_ch_pos : dict
+        Dictionary of channel positions.
+
+        .. versionadded:: 0.12
 
     Notes
     -----
     .. versionadded:: 0.9.0
     """
     def __init__(self, hsp, hpi, elp, point_names,
-                 nasion=None, lpa=None, rpa=None, dev_head_t=None):
+                 nasion=None, lpa=None, rpa=None, dev_head_t=None,
+                 dig_ch_pos=None):
         self.hsp = hsp
         self.hpi = hpi
         self.elp = elp
@@ -298,6 +378,7 @@ class DigMontage(object):
             self.dev_head_t = np.identity(4)
         else:
             self.dev_head_t = dev_head_t
+        self.dig_ch_pos = dig_ch_pos
 
     def __repr__(self):
         s = '<DigMontage | %d Dig Points, %d HPI points: %s ...>'
@@ -325,9 +406,23 @@ class DigMontage(object):
                             show_names=show_names)
 
 
+_cardinal_ident_mapping = {
+    FIFF.FIFFV_POINT_NASION: 'nasion',
+    FIFF.FIFFV_POINT_LPA: 'lpa',
+    FIFF.FIFFV_POINT_RPA: 'rpa',
+}
+
+
+def _check_frame(d, frame_str):
+    """Helper to check coordinate frames"""
+    if d['coord_frame'] != _str_to_frame[frame_str]:
+        raise RuntimeError('dig point must be in %s coordinate frame, got %s'
+                           % (frame_str, _frame_to_str[d['coord_frame']]))
+
+
 def read_dig_montage(hsp=None, hpi=None, elp=None, point_names=None,
-                     unit='mm', transform=True, dev_head_t=False):
-    """Read montage from a file
+                     unit='mm', fif=None, transform=True, dev_head_t=False):
+    """Read subject-specific digitization montage from a file
 
     Parameters
     ----------
@@ -335,23 +430,31 @@ def read_dig_montage(hsp=None, hpi=None, elp=None, point_names=None,
         If str, this corresponds to the filename of the headshape points.
         This is typically used with the Polhemus FastSCAN system.
         If numpy.array, this corresponds to an array of positions of the
-        channels in 3d.
+        headshape points in 3d. These points are in the native
+        digitizer space.
     hpi : None | str | array, shape (n_hpi, 3)
-        If str, this corresponds to the filename of hpi points. If numpy.array,
-        this corresponds to an array hpi points. These points are in
-        device space.
+        If str, this corresponds to the filename of Head Position Indicator
+        (HPI) points. If numpy.array, this corresponds to an array
+        of HPI points. These points are in device space.
     elp : None | str | array, shape (n_fids + n_hpi, 3)
-        If str, this corresponds to the filename of hpi points.
-        This is typically used with the Polhemus FastSCAN system.
-        If numpy.array, this corresponds to an array hpi points. These points
-        are in head space. Fiducials should be listed first, then the points
-        corresponding to the hpi.
+        If str, this corresponds to the filename of electrode position
+        points. This is typically used with the Polhemus FastSCAN system.
+        Fiducials should be listed first: nasion, left periauricular point,
+        right periauricular point, then the points corresponding to the HPI.
+        These points are in the native digitizer space.
+        If numpy.array, this corresponds to an array of fids + HPI points.
     point_names : None | list
         If list, this corresponds to a list of point names. This must be
         specified if elp is defined.
     unit : 'm' | 'cm' | 'mm'
         Unit of the input file. If not 'm', coordinates will be rescaled
         to 'm'. Default is 'mm'. This is applied only for hsp and elp files.
+    fif : str | None
+        FIF file from which to read digitization locations.
+        If str (filename), all other arguments are ignored.
+
+        .. versionadded:: 0.12
+
     transform : bool
         If True, points will be transformed to Neuromag space.
         The fidicuals, 'nasion', 'lpa', 'rpa' must be specified in
@@ -369,6 +472,10 @@ def read_dig_montage(hsp=None, hpi=None, elp=None, point_names=None,
     montage : instance of DigMontage
         The digitizer montage.
 
+    See Also
+    --------
+    read_montage : Function to read generic EEG templates
+
     Notes
     -----
     All digitized points will be transformed to head-based coordinate system
@@ -376,13 +483,56 @@ def read_dig_montage(hsp=None, hpi=None, elp=None, point_names=None,
 
     .. versionadded:: 0.9.0
     """
+    if not isinstance(unit, string_types) or unit not in('m', 'mm', 'cm'):
+        raise ValueError('unit must be "m", "mm", or "cm"')
+    scale = dict(m=1., mm=1e-3, cm=1e-2)[unit]
+    dig_ch_pos = None
+    fids = None
+    if fif is not None:
+        # Use a different code path
+        if dev_head_t or not transform:
+            raise ValueError('transform must be True and dev_head_t must be '
+                             'False for FIF dig montage')
+        if not all(x is None for x in (hsp, hpi, elp, point_names)):
+            raise ValueError('hsp, hpi, elp, and point_names must all be None '
+                             'if fif is not None')
+        _check_fname(fif, overwrite=True, must_exist=True)
+        # Load the dig data
+        f, tree = fiff_open(fif)[:2]
+        with f as fid:
+            dig = _read_dig_fif(fid, tree)
+        # Split up the dig points by category
+        hsp = list()
+        hpi = list()
+        elp = list()
+        point_names = list()
+        fids = dict()
+        dig_ch_pos = dict()
+        for d in dig:
+            if d['kind'] == FIFF.FIFFV_POINT_CARDINAL:
+                _check_frame(d, 'head')
+                fids[_cardinal_ident_mapping[d['ident']]] = d['r']
+            elif d['kind'] == FIFF.FIFFV_POINT_HPI:
+                _check_frame(d, 'head')
+                hpi.append(d['r'])
+                elp.append(d['r'])
+                point_names.append('HPI%03d' % d['ident'])
+            elif d['kind'] == FIFF.FIFFV_POINT_EXTRA:
+                _check_frame(d, 'head')
+                hsp.append(d['r'])
+            elif d['kind'] == FIFF.FIFFV_POINT_EEG:
+                _check_frame(d, 'head')
+                dig_ch_pos['EEG%03d' % d['ident']] = d['r']
+        fids = np.array([fids[key] for key in ('nasion', 'lpa', 'rpa')])
+        hsp = np.array(hsp)
+        hsp /= scale  # will be multiplied later
+        elp = np.array(elp)
+        elp /= scale  # will be multiplied later
+        transform = False
     if isinstance(hsp, string_types):
         hsp = _read_dig_points(hsp)
     if hsp is not None:
-        if unit == 'mm':
-            hsp *= 1e-3
-        if unit == 'cm':
-            hsp *= 1e-2
+        hsp = hsp * scale
     if isinstance(hpi, string_types):
         ext = op.splitext(hpi)[-1]
         if ext == '.txt':
@@ -398,11 +548,7 @@ def read_dig_montage(hsp=None, hpi=None, elp=None, point_names=None,
         if len(elp) != len(point_names):
             raise ValueError("The elp file contains %i points, but %i names "
                              "were specified." % (len(elp), len(point_names)))
-        if unit == 'mm':
-            elp *= 1e-3
-        elif unit == 'cm':
-            elp *= 1e-2
-
+        elp = elp * scale
     if transform:
         if elp is None:
             raise ValueError("ELP points are not specified. Points are needed "
@@ -421,25 +567,32 @@ def read_dig_montage(hsp=None, hpi=None, elp=None, point_names=None,
         nasion = elp[names_lower.index('nasion')]
         lpa = elp[names_lower.index('lpa')]
         rpa = elp[names_lower.index('rpa')]
+
+        # remove fiducials from elp
+        mask = np.ones(len(names_lower), dtype=bool)
+        for fid in ['nasion', 'lpa', 'rpa']:
+            mask[names_lower.index(fid)] = False
+        elp = elp[mask]
+
         neuromag_trans = get_ras_to_neuromag_trans(nasion, lpa, rpa)
 
         fids = np.array([nasion, lpa, rpa])
         fids = apply_trans(neuromag_trans, fids)
         elp = apply_trans(neuromag_trans, elp)
         hsp = apply_trans(neuromag_trans, hsp)
-    else:
+    elif fids is None:
         fids = [None] * 3
     if dev_head_t:
         from ..coreg import fit_matched_points
-        trans = fit_matched_points(tgt_pts=elp[3:], src_pts=hpi, out='trans')
+        trans = fit_matched_points(tgt_pts=elp, src_pts=hpi, out='trans')
     else:
         trans = np.identity(4)
 
     return DigMontage(hsp, hpi, elp, point_names, fids[0], fids[1], fids[2],
-                      trans)
+                      trans, dig_ch_pos)
 
 
-def _set_montage(info, montage):
+def _set_montage(info, montage, update_ch_names=False):
     """Apply montage to data.
 
     With a Montage, this function will replace the EEG channel names and
@@ -448,40 +601,88 @@ def _set_montage(info, montage):
     With a DigMontage, this function will replace the digitizer info with
     the values specified for the particular montage.
 
-    Note: This function will change the info variable in place.
+    Usually, a montage is expected to contain the positions of all EEG
+    electrodes and a warning is raised when this is not the case.
 
     Parameters
     ----------
     info : instance of Info
         The measurement info to update.
-    montage : instance of Montage
+    montage : instance of Montage | instance of DigMontage
         The montage to apply.
+    update_ch_names : bool
+        If True, overwrite the info channel names with the ones from montage.
+
+    Notes
+    -----
+    This function will change the info variable in place.
     """
     if isinstance(montage, Montage):
+        if update_ch_names:
+            info['chs'] = list()
+            for ii, ch_name in enumerate(montage.ch_names):
+                ch_info = {'cal': 1., 'logno': ii + 1, 'scanno': ii + 1,
+                           'range': 1.0, 'unit_mul': 0, 'ch_name': ch_name,
+                           'unit': FIFF.FIFF_UNIT_V, 'kind': FIFF.FIFFV_EEG_CH,
+                           'coord_frame': FIFF.FIFFV_COORD_HEAD,
+                           'coil_type': FIFF.FIFFV_COIL_EEG}
+                info['chs'].append(ch_info)
+            info._update_redundant()
+
         if not _contains_ch_type(info, 'eeg'):
             raise ValueError('No EEG channels found.')
 
-        sensors_found = False
+        sensors_found = []
         for pos, ch_name in zip(montage.pos, montage.ch_names):
             if ch_name not in info['ch_names']:
                 continue
 
             ch_idx = info['ch_names'].index(ch_name)
-            info['ch_names'][ch_idx] = ch_name
-            info['chs'][ch_idx]['eeg_loc'] = np.c_[pos, [0.] * 3]
             info['chs'][ch_idx]['loc'] = np.r_[pos, [0.] * 9]
-            sensors_found = True
+            sensors_found.append(ch_idx)
 
-        if not sensors_found:
+        if len(sensors_found) == 0:
             raise ValueError('None of the sensors defined in the montage were '
                              'found in the info structure. Check the channel '
                              'names.')
+
+        eeg_sensors = pick_types(info, meg=False, ref_meg=False, eeg=True,
+                                 exclude=[])
+        not_found = np.setdiff1d(eeg_sensors, sensors_found)
+        if len(not_found) > 0:
+            not_found_names = [info['ch_names'][ch] for ch in not_found]
+            warn('The following EEG sensors did not have a position '
+                 'specified in the selected montage: ' +
+                 str(not_found_names) + '. Their position has been '
+                 'left untouched.')
+
     elif isinstance(montage, DigMontage):
         dig = _make_dig_points(nasion=montage.nasion, lpa=montage.lpa,
                                rpa=montage.rpa, hpi=montage.hpi,
-                               dig_points=montage.hsp)
+                               dig_points=montage.hsp,
+                               dig_ch_pos=montage.dig_ch_pos)
         info['dig'] = dig
         info['dev_head_t']['trans'] = montage.dev_head_t
+        if montage.dig_ch_pos is not None:  # update channel positions, too
+            eeg_ref_pos = montage.dig_ch_pos.get('EEG000', np.zeros(3))
+            did_set = np.zeros(len(info['ch_names']), bool)
+            is_eeg = np.zeros(len(info['ch_names']), bool)
+            is_eeg[pick_types(info, meg=False, eeg=True, exclude=())] = True
+            for ch_name, ch_pos in montage.dig_ch_pos.items():
+                if ch_name == 'EEG000':
+                    continue
+                if ch_name not in info['ch_names']:
+                    raise RuntimeError('Montage channel %s not found in info'
+                                       % ch_name)
+                idx = info['ch_names'].index(ch_name)
+                did_set[idx] = True
+                this_loc = np.concatenate((ch_pos, eeg_ref_pos))
+                info['chs'][idx]['loc'][:6] = this_loc
+            did_not_set = [info['chs'][ii]['ch_name']
+                           for ii in np.where(is_eeg & ~did_set)[0]]
+            if len(did_not_set) > 0:
+                warn('Did not set %s channel positions:\n%s'
+                     % (len(did_not_set), ', '.join(did_not_set)))
     else:
         raise TypeError("Montage must be a 'Montage' or 'DigMontage' "
                         "instead of '%s'." % type(montage))

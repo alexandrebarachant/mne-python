@@ -3,22 +3,21 @@
 # License: BSD (3-clause)
 
 from ..externals.six import string_types
-from warnings import warn
-from inspect import getargspec, getmembers
+from inspect import getmembers
 
 import numpy as np
 from scipy.fftpack import fftfreq
 
 from .utils import check_indices
-from ..fixes import tril_indices, partial
+from ..fixes import tril_indices, partial, _get_args
 from ..parallel import parallel_func
 from ..source_estimate import _BaseSourceEstimate
-from .. import Epochs
+from ..epochs import _BaseEpochs
 from ..time_frequency.multitaper import (dpss_windows, _mt_spectra,
                                          _psd_from_mt, _csd_from_mt,
                                          _psd_from_mt_adaptive)
 from ..time_frequency.tfr import morlet, cwt
-from ..utils import logger, verbose, _time_mask
+from ..utils import logger, verbose, _time_mask, warn
 
 ########################################################################
 # Various connectivity estimators
@@ -519,8 +518,7 @@ def spectral_connectivity(data, method='coh', indices=None, sfreq=2 * np.pi,
                           mt_low_bias=True, cwt_frequencies=None,
                           cwt_n_cycles=7, block_size=1000, n_jobs=1,
                           verbose=None):
-    """Compute various frequency-domain and time-frequency domain connectivity
-    measures.
+    """Compute frequency-domain and time-frequency domain connectivity measures
 
     The connectivity method(s) are specified using the "method" parameter.
     All methods are based on estimates of the cross- and power spectral
@@ -594,6 +592,7 @@ def spectral_connectivity(data, method='coh', indices=None, sfreq=2 * np.pi,
 
         'wpli2_debiased' : Debiased estimator of squared WPLI [5].
 
+
     References
     ----------
 
@@ -620,15 +619,14 @@ def spectral_connectivity(data, method='coh', indices=None, sfreq=2 * np.pi,
 
     Parameters
     ----------
-    data : array, shape=(n_epochs, n_signals, n_times)
-           or list/generator of array, shape =(n_signals, n_times)
-           or list/generator of SourceEstimate or VolSourceEstimate
-           or Epochs
+    data : array-like, shape=(n_epochs, n_signals, n_times) | Epochs
         The data from which to compute connectivity. Note that it is also
         possible to combine multiple signals by providing a list of tuples,
         e.g., data = [(arr_0, stc_0), (arr_1, stc_1), (arr_2, stc_2)],
         corresponds to 3 epochs, and arr_* could be an array with the same
-        number of time points as stc_*.
+        number of time points as stc_*. The array-like object can also
+        be a list/generator of array, shape =(n_signals, n_times),
+        or a list/generator of SourceEstimate or VolSourceEstimate objects.
     method : string | list of string
         Connectivity measure(s) to compute.
     indices : tuple of arrays | None
@@ -745,7 +743,7 @@ def spectral_connectivity(data, method='coh', indices=None, sfreq=2 * np.pi,
             con_method_types.append(m)
 
     # determine how many arguments the compute_con_function needs
-    n_comp_args = [len(getargspec(mtype.compute_con).args)
+    n_comp_args = [len(_get_args(mtype.compute_con))
                    for mtype in con_method_types]
 
     # we only support 3 or 5 arguments
@@ -756,7 +754,7 @@ def spectral_connectivity(data, method='coh', indices=None, sfreq=2 * np.pi,
     # if none of the comp_con functions needs the PSD, we don't estimate it
     accumulate_psd = any(n == 5 for n in n_comp_args)
 
-    if isinstance(data, Epochs):
+    if isinstance(data, _BaseEpochs):
         times_in = data.times  # input times for Epochs input type
         sfreq = data.info['sfreq']
 
@@ -780,7 +778,7 @@ def spectral_connectivity(data, method='coh', indices=None, sfreq=2 * np.pi,
                                        endpoint=False)
 
             n_times_in = len(times_in)
-            mask = _time_mask(times_in, tmin, tmax)
+            mask = _time_mask(times_in, tmin, tmax, sfreq=sfreq)
             tmin_idx, tmax_idx = np.where(mask)[0][[0, -1]]
             tmax_idx += 1
             tmin_true = times_in[tmin_idx]

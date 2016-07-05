@@ -5,10 +5,11 @@
 #
 # License: BSD (3-clause)
 
-import inspect
 import warnings
-import six
 import numpy as np
+
+from ..externals.six import iteritems
+from ..fixes import _get_args
 
 
 class BaseEstimator(object):
@@ -32,7 +33,7 @@ class BaseEstimator(object):
 
         # introspect the constructor arguments to find the model parameters
         # to represent
-        args, varargs, kw, default = inspect.getargspec(init)
+        args, varargs = _get_args(init, varargs=True)
         if varargs is not None:
             raise RuntimeError("scikit-learn estimators should always "
                                "specify their parameters in the signature"
@@ -97,7 +98,7 @@ class BaseEstimator(object):
             # Simple optimisation to gain speed (inspect is slow)
             return self
         valid_params = self.get_params(deep=True)
-        for key, value in six.iteritems(params):
+        for key, value in iteritems(params):
             split = key.split('__', 1)
             if len(split) > 1:
                 # nested objects case
@@ -134,7 +135,7 @@ def _pprint(params, offset=0, printer=repr):
     params: dict
         The dictionary to pretty print
     offset: int
-        The offset in characters to add at the begin of each line.
+        The offset in characters to add at the beginning of each line.
     printer:
         The function to convert entries to strings, typically
         the builtin str or repr
@@ -146,7 +147,7 @@ def _pprint(params, offset=0, printer=repr):
     params_list = list()
     this_line_length = offset
     line_sep = ',\n' + (1 + offset // 2) * ' '
-    for i, (k, v) in enumerate(sorted(six.iteritems(params))):
+    for i, (k, v) in enumerate(sorted(iteritems(params))):
         if type(v) is float:
             # use str for representing floating point numbers
             # this way we get consistent representation across
@@ -177,19 +178,19 @@ def _pprint(params, offset=0, printer=repr):
 class LinearModel(BaseEstimator):
     """
     This object clones a Linear Model from scikit-learn
-    and updates the attribute for each fit. The linear model coefficient
+    and updates the attributes for each fit. The linear model coefficients
     (filters) are used to extract discriminant neural sources from
-    the measured data. This class implement the computation of patterns
+    the measured data. This class implements the computation of patterns
     which provides neurophysiologically interpretable information [1],
     in the sense that significant nonzero weights are only observed at channels
-    the activity of which is related to discriminant neural sources.
+    where activity is related to discriminant neural sources.
 
     Parameters
     ----------
     model : object | None
         A linear model from scikit-learn with a fit method
         that updates a coef_ attribute.
-        If None the model will be a LogisticRegression
+        If None the model will be LogisticRegression
 
     Attributes
     ----------
@@ -225,8 +226,8 @@ class LinearModel(BaseEstimator):
         self.filters_ = None
 
     def fit(self, X, y):
-        """Estimate the coefficient of the linear model.
-        Save the coefficient in the attribute filters_ and
+        """Estimate the coefficients of the linear model.
+        Save the coefficients in the attribute filters_ and
         computes the attribute patterns_ using [1].
 
         Parameters
@@ -273,7 +274,7 @@ class LinearModel(BaseEstimator):
         return self.model.transform(X)
 
     def fit_transform(self, X, y):
-        """fit the data and transform it using the linear model.
+        """Fit the data and transform it using the linear model.
 
         Parameters
         ----------
@@ -291,12 +292,12 @@ class LinearModel(BaseEstimator):
         return self.fit(X, y).transform(X)
 
     def predict(self, X):
-        """Computes prediction of X.
+        """Computes predictions of y from X.
 
         Parameters
         ----------
         X : array, shape (n_epochs, n_features)
-            The data used to compute prediction.
+            The data used to compute the predictions.
 
         Returns
         -------
@@ -351,7 +352,8 @@ class LinearModel(BaseEstimator):
         ch_type : 'mag' | 'grad' | 'planar1' | 'planar2' | 'eeg' | None
             The channel type to plot. For 'grad', the gradiometers are
             collected in pairs and the RMS for each pair is plotted.
-            If None, then channels are chosen in the order given above.
+            If None, then first available channel type from order given
+            above is used. Defaults to None.
         layout : None | Layout
             Layout instance specifying sensor positions (does not need to be
             specified for Neuromag data). If possible, the correct layout file
@@ -366,9 +368,20 @@ class LinearModel(BaseEstimator):
             If None, the maximum absolute value is used. If vmin is None,
             but vmax is not, defaults to np.min(data).
             If callable, the output equals vmax(data).
-        cmap : matplotlib colormap
-            Colormap. For magnetometers and eeg defaults to 'RdBu_r', else
-            'Reds'.
+        cmap : matplotlib colormap | (colormap, bool) | 'interactive' | None
+            Colormap to use. If tuple, the first value indicates the colormap
+            to use and the second value is a boolean defining interactivity. In
+            interactive mode the colors are adjustable by clicking and dragging
+            the colorbar with left and right mouse button. Left mouse button
+            moves the scale up and down and right mouse button adjusts the
+            range. Hitting space bar resets the range. Up and down arrows can
+            be used to change the colormap. If None, 'Reds' is used for all
+            positive data, otherwise defaults to 'RdBu_r'. If 'interactive',
+            translates to (None, True). Defaults to 'RdBu_r'.
+
+            .. warning::  Interactive mode works smoothly only for a small
+                amount of topomaps.
+
         sensors : bool | str
             Add markers for sensor locations to the plot. Accepts matplotlib
             plot format string (e.g., 'r+' for red plusses). If True,
@@ -407,7 +420,7 @@ class LinearModel(BaseEstimator):
             Title. If None (default), no title is displayed.
         mask : ndarray of bool, shape (n_channels, n_times) | None
             The channels to be marked as significant at a given time point.
-            Indicies set to `True` will be considered. Defaults to None.
+            Indices set to `True` will be considered. Defaults to None.
         mask_params : dict | None
             Additional plotting parameters for plotting significant sensors.
             Default (None) equals::
@@ -415,16 +428,17 @@ class LinearModel(BaseEstimator):
                 dict(marker='o', markerfacecolor='w', markeredgecolor='k',
                      linewidth=0, markersize=4)
 
-        outlines : 'head' | dict | None
-            The outlines to be drawn. If 'head', a head scheme will be drawn.
-            If dict, each key refers to a tuple of x and y positions.
-            The values in 'mask_pos' will serve as image mask.
-            If None, nothing will be drawn. Defaults to 'head'.
-            If dict, the 'autoshrink' (bool) field will trigger automated
-            shrinking of the positions due to points outside the outline.
-            Moreover, a matplotlib patch object can be passed for
-            advanced masking options, either directly or as a function that
-            returns patches (required for multi-axis plots).
+        outlines : 'head' | 'skirt' | dict | None
+            The outlines to be drawn. If 'head', the default head scheme will
+            be drawn. If 'skirt' the head scheme will be drawn, but sensors are
+            allowed to be plotted outside of the head circle. If dict, each key
+            refers to a tuple of x and y positions, the values in 'mask_pos'
+            will serve as image mask, and the 'autoshrink' (bool) field will
+            trigger automated shrinking of the positions due to points outside
+            the outline. Alternatively, a matplotlib patch object can be passed
+            for advanced masking options, either directly or as a function that
+            returns patches (required for multi-axis plots). If None, nothing
+            will be drawn. Defaults to 'head'.
         contours : int | False | None
             The number of contour lines to draw.
             If 0, no contours will be drawn.
@@ -452,6 +466,7 @@ class LinearModel(BaseEstimator):
 
         if times is None:
             tmin = 0
+            times = 'auto'
         else:
             tmin = times[0]
 
@@ -498,7 +513,8 @@ class LinearModel(BaseEstimator):
         ch_type : 'mag' | 'grad' | 'planar1' | 'planar2' | 'eeg' | None
             The channel type to plot. For 'grad', the gradiometers are
             collected in pairs and the RMS for each pair is plotted.
-            If None, then channels are chosen in the order given above.
+            If None, then first available channel type from order given
+            above is used. Defaults to None.
         layout : None | Layout
             Layout instance specifying sensor positions (does not need to be
             specified for Neuromag data). If possible, the correct layout file
@@ -513,9 +529,20 @@ class LinearModel(BaseEstimator):
             If None, the maximum absolute value is used. If vmin is None,
             but vmax is not, defaults to np.min(data).
             If callable, the output equals vmax(data).
-        cmap : matplotlib colormap
-            Colormap. For magnetometers and eeg defaults to 'RdBu_r', else
-            'Reds'.
+        cmap : matplotlib colormap | (colormap, bool) | 'interactive' | None
+            Colormap to use. If tuple, the first value indicates the colormap
+            to use and the second value is a boolean defining interactivity. In
+            interactive mode the colors are adjustable by clicking and dragging
+            the colorbar with left and right mouse button. Left mouse button
+            moves the scale up and down and right mouse button adjusts the
+            range. Hitting space bar resets the range. Up and down arrows can
+            be used to change the colormap. If None, 'Reds' is used for all
+            positive data, otherwise defaults to 'RdBu_r'. If 'interactive',
+            translates to (None, True). Defaults to 'RdBu_r'.
+
+            .. warning::  Interactive mode works smoothly only for a small
+                amount of topomaps.
+
         sensors : bool | str
             Add markers for sensor locations to the plot. Accepts matplotlib
             plot format string (e.g., 'r+' for red plusses). If True,
@@ -554,7 +581,7 @@ class LinearModel(BaseEstimator):
             Title. If None (default), no title is displayed.
         mask : ndarray of bool, shape (n_channels, n_times) | None
             The channels to be marked as significant at a given time point.
-            Indicies set to `True` will be considered. Defaults to None.
+            Indices set to `True` will be considered. Defaults to None.
         mask_params : dict | None
             Additional plotting parameters for plotting significant sensors.
             Default (None) equals::
@@ -562,16 +589,17 @@ class LinearModel(BaseEstimator):
                 dict(marker='o', markerfacecolor='w', markeredgecolor='k',
                      linewidth=0, markersize=4)
 
-        outlines : 'head' | dict | None
-            The outlines to be drawn. If 'head', a head scheme will be drawn.
-            If dict, each key refers to a tuple of x and y positions.
-            The values in 'mask_pos' will serve as image mask.
-            If None, nothing will be drawn. Defaults to 'head'.
-            If dict, the 'autoshrink' (bool) field will trigger automated
-            shrinking of the positions due to points outside the outline.
-            Moreover, a matplotlib patch object can be passed for
-            advanced masking options, either directly or as a function that
-            returns patches (required for multi-axis plots).
+        outlines : 'head' | 'skirt' | dict | None
+            The outlines to be drawn. If 'head', the default head scheme will
+            be drawn. If 'skirt' the head scheme will be drawn, but sensors are
+            allowed to be plotted outside of the head circle. If dict, each key
+            refers to a tuple of x and y positions, the values in 'mask_pos'
+            will serve as image mask, and the 'autoshrink' (bool) field will
+            trigger automated shrinking of the positions due to points outside
+            the outline. Alternatively, a matplotlib patch object can be passed
+            for advanced masking options, either directly or as a function that
+            returns patches (required for multi-axis plots). If None, nothing
+            will be drawn. Defaults to 'head'.
         contours : int | False | None
             The number of contour lines to draw.
             If 0, no contours will be drawn.
@@ -599,6 +627,7 @@ class LinearModel(BaseEstimator):
 
         if times is None:
             tmin = 0
+            times = 'auto'
         else:
             tmin = times[0]
 

@@ -14,33 +14,55 @@ import math
 from functools import partial
 import difflib
 import webbrowser
-from warnings import warn
 import tempfile
 import numpy as np
+from copy import deepcopy
 
-from ..io import show_fiff
-from ..utils import verbose, set_config
+from ..channels.layout import _auto_topomap_coords
+from ..channels.channels import _contains_ch_type
+from ..defaults import _handle_default
+from ..io import show_fiff, Info
+from ..io.pick import channel_type, channel_indices_by_type, pick_channels
+from ..utils import verbose, set_config, warn
+from ..externals.six import string_types
+from ..fixes import _get_argrelmax
+from ..selection import (read_selection, _SELECTIONS, _EEG_SELECTIONS,
+                         _divide_to_regions)
 
 
 COLORS = ['b', 'g', 'r', 'c', 'm', 'y', 'k', '#473C8B', '#458B74',
           '#CD7F32', '#FF4040', '#ADFF2F', '#8E2323', '#FF1493']
 
 
-def _setup_vmin_vmax(data, vmin, vmax):
-    """Aux function to handle vmin and vamx parameters"""
+def _setup_vmin_vmax(data, vmin, vmax, norm=False):
+    """Aux function to handle vmin and vmax parameters"""
     if vmax is None and vmin is None:
         vmax = np.abs(data).max()
-        vmin = -vmax
+        if norm:
+            vmin = 0.
+        else:
+            vmin = -vmax
     else:
         if callable(vmin):
             vmin = vmin(data)
         elif vmin is None:
-            vmin = np.min(data)
+            if norm:
+                vmin = 0.
+            else:
+                vmin = np.min(data)
         if callable(vmax):
             vmax = vmax(data)
-        elif vmin is None:
+        elif vmax is None:
             vmax = np.max(data)
     return vmin, vmax
+
+
+def plt_show(show=True, **kwargs):
+    """Helper to show a figure while suppressing warnings"""
+    import matplotlib
+    import matplotlib.pyplot as plt
+    if show and matplotlib.get_backend() != 'agg':
+        plt.show(**kwargs)
 
 
 def tight_layout(pad=1.2, h_pad=None, w_pad=None, fig=None):
@@ -69,13 +91,11 @@ def tight_layout(pad=1.2, h_pad=None, w_pad=None, fig=None):
     try:  # see https://github.com/matplotlib/matplotlib/issues/2654
         fig.tight_layout(pad=pad, h_pad=h_pad, w_pad=w_pad)
     except Exception:
-        warn('Matplotlib function \'tight_layout\' is not supported.'
-             ' Skipping subplot adjusment.')
-    else:
         try:
             fig.set_tight_layout(dict(pad=pad, h_pad=h_pad, w_pad=w_pad))
         except Exception:
-            pass
+            warn('Matplotlib function "tight_layout" is not supported.'
+                 ' Skipping subplot adjustment.')
 
 
 def _check_delayed_ssp(container):
@@ -87,6 +107,32 @@ def _check_delayed_ssp(container):
                            ' the data with proj set to False.')
     elif len(container.info['projs']) < 1:
         raise RuntimeError('No projs found in evoked.')
+
+
+def _validate_if_list_of_axes(axes, obligatory_len=None):
+    """ Helper function that validates whether input is a list/array of axes"""
+    import matplotlib as mpl
+    if obligatory_len is not None and not isinstance(obligatory_len, int):
+        raise ValueError('obligatory_len must be None or int, got %d',
+                         'instead' % type(obligatory_len))
+    if not isinstance(axes, (list, np.ndarray)):
+        raise ValueError('axes must be a list or numpy array of matplotlib '
+                         'axes objects, got %s instead.' % type(axes))
+    if isinstance(axes, np.ndarray) and axes.ndim > 1:
+        raise ValueError('if input is a numpy array, it must be '
+                         'one-dimensional. The received numpy array has %d '
+                         'dimensions however. Try using ravel or flatten '
+                         'method of the array.' % axes.ndim)
+    is_correct_type = np.array([isinstance(x, mpl.axes.Axes)
+                               for x in axes])
+    if not np.all(is_correct_type):
+        first_bad = np.where(np.logical_not(is_correct_type))[0][0]
+        raise ValueError('axes must be a list or numpy array of matplotlib '
+                         'axes objects while one of the list elements is '
+                         '%s.' % type(axes[first_bad]))
+    if obligatory_len is not None and not len(axes) == obligatory_len:
+        raise ValueError('axes must be a list/array of length %d, while the'
+                         ' length is %d' % (obligatory_len, len(axes)))
 
 
 def mne_analyze_colormap(limits=[5, 10, 15], format='mayavi'):
@@ -225,8 +271,9 @@ def _get_help_text(params):
     text.append(u'+ or = : \n')
     text.append(u'Home : \n')
     text.append(u'End : \n')
-    text.append(u'Page down : \n')
-    text.append(u'Page up : \n')
+    if 'fig_selection' not in params:
+        text.append(u'Page down : \n')
+        text.append(u'Page up : \n')
 
     text.append(u'F11 : \n')
     text.append(u'? : \n')
@@ -260,8 +307,9 @@ def _get_help_text(params):
             text.append(u'click channel name :\n')
             text2.insert(2, 'Navigate channels down\n')
             text2.insert(3, 'Navigate channels up\n')
-            text2.insert(8, 'Reduce the number of channels per view\n')
-            text2.insert(9, 'Increase the number of channels per view\n')
+            if 'fig_selection' not in params:
+                text2.insert(8, 'Reduce the number of channels per view\n')
+                text2.insert(9, 'Increase the number of channels per view\n')
             text2.append('Mark bad channel\n')
             text2.append('Vertical line at a time instant\n')
             text2.append('Mark bad channel\n')
@@ -281,6 +329,7 @@ def _get_help_text(params):
             text2.append('Show topography for the component\n')
         else:
             text.append(u'click channel name :\n')
+            text.append(u'right click channel name :\n')
             text2.insert(2, 'Navigate channels down\n')
             text2.insert(3, 'Navigate channels up\n')
             text2.insert(8, 'Reduce the number of channels per view\n')
@@ -292,6 +341,7 @@ def _get_help_text(params):
             text2.append('Mark bad epoch\n')
             text2.append('Vertical line at a time instant\n')
             text2.append('Mark bad channel\n')
+            text2.append('Plot ERP/ERF image\n')
             text.append(u'middle click :\n')
             text2.append('Show channel name (butterfly plot)\n')
         text.insert(11, u'o : \n')
@@ -314,7 +364,10 @@ def _prepare_trellis(n_cells, max_col):
     fig, axes = plt.subplots(nrow, ncol, figsize=(7.4, 1.5 * nrow + 1))
     axes = [axes] if ncol == nrow == 1 else axes.flatten()
     for ax in axes[n_cells:]:  # hide unused axes
-        ax.set_visible(False)
+        # XXX: Previously done by ax.set_visible(False), but because of mpl
+        # bug, we just hide the frame.
+        from .topomap import _hide_frame
+        _hide_frame(ax)
     return fig, axes
 
 
@@ -350,7 +403,7 @@ def _draw_proj_checkbox(event, params, draw_current_state=True):
     # this should work for non-test cases
     try:
         fig_proj.canvas.draw()
-        fig_proj.show()
+        fig_proj.show(warn=False)
     except Exception:
         pass
 
@@ -448,12 +501,12 @@ def compare_fiff(fname_1, fname_2, fname_out=None, show=True, indent='    ',
                        read_limit=read_limit, max_str=max_str)
     diff = difflib.HtmlDiff().make_file(file_1, file_2, fname_1, fname_2)
     if fname_out is not None:
-        f = open(fname_out, 'w')
+        f = open(fname_out, 'wb')
     else:
-        f = tempfile.NamedTemporaryFile('w', delete=False, suffix='.html')
+        f = tempfile.NamedTemporaryFile('wb', delete=False, suffix='.html')
         fname_out = f.name
     with f as fid:
-        fid.write(diff)
+        fid.write(diff.encode('utf-8'))
     if show is True:
         webbrowser.open_new_tab(fname_out)
     return fname_out
@@ -486,8 +539,11 @@ def _helper_raw_resize(event, params):
 
 def _plot_raw_onscroll(event, params, len_channels=None):
     """Interpret scroll events"""
+    if 'fig_selection' in params:
+        _change_channel_group(event.step, params)
+        return
     if len_channels is None:
-        len_channels = len(params['info']['ch_names'])
+        len_channels = len(params['inds'])
     orig_start = params['ch_start']
     if event.step < 0:
         params['ch_start'] = min(params['ch_start'] + params['n_channels'],
@@ -520,17 +576,94 @@ def _plot_raw_time(value, params):
         params['hsel_patch'].set_x(value)
 
 
+def _radio_clicked(label, params):
+    """Callback for radio buttons in selection dialog."""
+    from .evoked import _rgb
+    labels = [l._text for l in params['fig_selection'].radio.labels]
+    idx = labels.index(label)
+    params['fig_selection'].radio._active_idx = idx
+    channels = params['selections'][label]
+    ax_topo = params['fig_selection'].get_axes()[1]
+    for type in ('mag', 'grad', 'eeg', 'seeg'):
+        if type in params['types']:
+            types = np.where(np.array(params['types']) == type)[0]
+            break
+    colors = np.zeros((len(types), 4))  # alpha = 0 by default
+    locs3d = np.array([ch['loc'][:3] for ch in params['info']['chs']])
+    x, y, z = locs3d.T
+    color_vals = _rgb(params['info'], x, y, z)
+    for color_idx, pick in enumerate(types):
+        if pick in channels:  # set color and alpha = 1
+            colors[color_idx] = np.append(color_vals[pick], 1.)
+    ax_topo.collections[0]._facecolors = colors
+    params['fig_selection'].canvas.draw()
+
+    nchan = sum([len(params['selections'][l]) for l in labels[:idx]])
+    params['vsel_patch'].set_y(nchan)
+    n_channels = len(channels)
+    params['n_channels'] = n_channels
+    params['inds'] = channels
+    for line in params['lines'][n_channels:]:  # To remove lines from view.
+        line.set_xdata([])
+        line.set_ydata([])
+    _setup_browser_offsets(params, n_channels)
+    params['plot_fun']()
+
+
+def _set_radio_button(idx, params):
+    """Helper for setting radio button."""
+    # XXX: New version of matplotlib has this implemented for radio buttons,
+    # This function is for compatibility with old versions of mpl.
+    radio = params['fig_selection'].radio
+    radio.circles[radio._active_idx].set_facecolor((1., 1., 1., 1.))
+    radio.circles[idx].set_facecolor((0., 0., 1., 1.))
+    _radio_clicked(radio.labels[idx]._text, params)
+
+
+def _change_channel_group(step, params):
+    """Deal with change of channel group."""
+    radio = params['fig_selection'].radio
+    idx = radio._active_idx
+    if step < 0:
+        if idx < len(radio.labels) - 1:
+            _set_radio_button(idx + 1, params)
+    else:
+        if idx > 0:
+            _set_radio_button(idx - 1, params)
+    return
+
+
+def _handle_change_selection(event, params):
+    """Helper for handling clicks on vertical scrollbar using selections."""
+    radio = params['fig_selection'].radio
+    ydata = event.ydata
+    labels = [label._text for label in radio.labels]
+    offset = 0
+    for idx, label in enumerate(labels):
+        nchans = len(params['selections'][label])
+        offset += nchans
+        if ydata < offset:
+            _set_radio_button(idx, params)
+            return
+
+
 def _plot_raw_onkey(event, params):
     """Interpret key presses"""
     import matplotlib.pyplot as plt
     if event.key == 'escape':
         plt.close(params['fig'])
     elif event.key == 'down':
+        if 'fig_selection' in params.keys():
+            _change_channel_group(-1, params)
+            return
         params['ch_start'] += params['n_channels']
-        _channels_changed(params, len(params['info']['ch_names']))
+        _channels_changed(params, len(params['inds']))
     elif event.key == 'up':
+        if 'fig_selection' in params.keys():
+            _change_channel_group(1, params)
+            return
         params['ch_start'] -= params['n_channels']
-        _channels_changed(params, len(params['info']['ch_names']))
+        _channels_changed(params, len(params['inds']))
     elif event.key == 'right':
         value = params['t_start'] + params['duration']
         _plot_raw_time(value, params)
@@ -547,27 +680,19 @@ def _plot_raw_onkey(event, params):
     elif event.key == '-':
         params['scale_factor'] /= 1.1
         params['plot_fun']()
-    elif event.key == 'pageup':
+    elif event.key == 'pageup' and 'fig_selection' not in params:
         n_channels = params['n_channels'] + 1
-        offset = params['ax'].get_ylim()[0] / n_channels
-        params['offsets'] = np.arange(n_channels) * offset + (offset / 2.)
-        params['n_channels'] = n_channels
-        params['ax'].set_yticks(params['offsets'])
-        params['vsel_patch'].set_height(n_channels)
-        _channels_changed(params, len(params['info']['ch_names']))
-    elif event.key == 'pagedown':
+        _setup_browser_offsets(params, n_channels)
+        _channels_changed(params, len(params['inds']))
+    elif event.key == 'pagedown' and 'fig_selection' not in params:
         n_channels = params['n_channels'] - 1
         if n_channels == 0:
             return
-        offset = params['ax'].get_ylim()[0] / n_channels
-        params['offsets'] = np.arange(n_channels) * offset + (offset / 2.)
-        params['n_channels'] = n_channels
-        params['ax'].set_yticks(params['offsets'])
-        params['vsel_patch'].set_height(n_channels)
+        _setup_browser_offsets(params, n_channels)
         if len(params['lines']) > n_channels:  # remove line from view
             params['lines'][n_channels].set_xdata([])
             params['lines'][n_channels].set_ydata([])
-        _channels_changed(params, len(params['info']['ch_names']))
+        _channels_changed(params, len(params['inds']))
     elif event.key == 'home':
         duration = params['duration'] - 1.0
         if duration <= 0:
@@ -606,10 +731,13 @@ def _mouse_click(event, params):
         params['label_click_fun'](pos)
     # vertical scrollbar changed
     if event.inaxes == params['ax_vscroll']:
-        ch_start = max(int(event.ydata) - params['n_channels'] // 2, 0)
-        if params['ch_start'] != ch_start:
-            params['ch_start'] = ch_start
-            params['plot_fun']()
+        if 'fig_selection' in params.keys():
+            _handle_change_selection(event, params)
+        else:
+            ch_start = max(int(event.ydata) - params['n_channels'] // 2, 0)
+            if params['ch_start'] != ch_start:
+                params['ch_start'] = ch_start
+                params['plot_fun']()
     # horizontal scrollbar changed
     elif event.inaxes == params['ax_hscroll']:
         _plot_raw_time(event.xdata - params['duration'] / 2, params)
@@ -618,6 +746,38 @@ def _mouse_click(event, params):
 
     elif event.inaxes == params['ax']:
         params['pick_bads_fun'](event)
+
+
+def _handle_topomap_bads(ch_name, params):
+    """Helper for coloring channels in selection topomap when selecting bads"""
+    for type in ('mag', 'grad', 'eeg', 'seeg'):
+        if type in params['types']:
+            types = np.where(np.array(params['types']) == type)[0]
+            break
+    color_ind = np.where(np.array(
+        params['info']['ch_names'])[types] == ch_name)[0]
+    if len(color_ind) > 0:
+        sensors = params['fig_selection'].axes[1].collections[0]
+        this_color = sensors._edgecolors[color_ind][0]
+        if all(this_color == [1., 0., 0., 1.]):  # is red
+            sensors._edgecolors[color_ind] = [0., 0., 0., 1.]
+        else:  # is black
+            sensors._edgecolors[color_ind] = [1., 0., 0., 1.]
+        params['fig_selection'].canvas.draw()
+
+
+def _find_channel_idx(ch_name, params):
+    """Helper for finding all indices when using selections."""
+    indices = list()
+    offset = 0
+    labels = [l._text for l in params['fig_selection'].radio.labels]
+    for label in labels:
+        selection = params['selections'][label]
+        hits = np.where(np.array(params['raw'].ch_names)[selection] == ch_name)
+        for idx in hits[0]:
+            indices.append(offset + idx)
+        offset += len(selection)
+    return indices
 
 
 def _select_bads(event, params, bads):
@@ -634,7 +794,12 @@ def _select_bads(event, params, bads):
             if ymin <= event.ydata <= ymax:
                 this_chan = vars(line)['ch_name']
                 if this_chan in params['info']['ch_names']:
-                    ch_idx = params['ch_start'] + lines.index(line)
+                    if 'fig_selection' in params:
+                        ch_idx = _find_channel_idx(this_chan, params)
+                        _handle_topomap_bads(this_chan, params)
+                    else:
+                        ch_idx = [params['ch_start'] + lines.index(line)]
+
                     if this_chan not in bads:
                         bads.append(this_chan)
                         color = params['bad_color']
@@ -645,13 +810,15 @@ def _select_bads(event, params, bads):
                         color = vars(line)['def_color']
                         line.set_zorder(0)
                     line.set_color(color)
-                    params['ax_vscroll'].patches[ch_idx].set_color(color)
+                    for idx in ch_idx:
+                        params['ax_vscroll'].patches[idx].set_color(color)
                     break
     else:
         x = np.array([event.xdata] * 2)
         params['ax_vertline'].set_data(x, np.array(params['ax'].get_ylim()))
         params['ax_hscroll_vertline'].set_data(x, np.array([0., 1.]))
         params['vertline_t'].set_text('%0.3f' % x[0])
+
     return bads
 
 
@@ -683,9 +850,22 @@ def _onclick_help(event, params):
     # this should work for non-test cases
     try:
         fig_help.canvas.draw()
-        fig_help.show()
+        fig_help.show(warn=False)
     except Exception:
         pass
+
+
+def _setup_browser_offsets(params, n_channels):
+    """Aux function for computing viewport height and adjusting offsets."""
+    ylim = [n_channels * 2 + 1, 0]
+    offset = ylim[0] / n_channels
+    params['offsets'] = np.arange(n_channels) * offset + (offset / 2.)
+    params['n_channels'] = n_channels
+    params['ax'].set_yticks(params['offsets'])
+    params['ax'].set_ylim(ylim)
+    params['vsel_patch'].set_height(n_channels)
+    line = params['ax_vertline']
+    line.set_data(line._x, np.array(params['ax'].get_ylim()))
 
 
 class ClickableImage(object):
@@ -703,7 +883,7 @@ class ClickableImage(object):
 
     Parameters
     ----------
-    imdata: ndarray
+    imdata : ndarray
         The image that you wish to click on for 2-d points.
     **kwargs : dict
         Keyword arguments. Passed to ax.imshow.
@@ -716,7 +896,7 @@ class ClickableImage(object):
 
     def __init__(self, imdata, **kwargs):
         """Display the image for clicking."""
-        from matplotlib.pyplot import figure, show
+        from matplotlib.pyplot import figure
         self.coords = []
         self.imdata = imdata
         self.fig = figure()
@@ -728,14 +908,14 @@ class ClickableImage(object):
                                  picker=True, **kwargs)
         self.ax.axis('off')
         self.fig.canvas.mpl_connect('pick_event', self.onclick)
-        show()
+        plt_show()
 
     def onclick(self, event):
         """Mouse click handler.
 
         Parameters
         ----------
-        event: matplotlib event object
+        event : matplotlib event object
             The matplotlib object that we use to get x/y position.
         """
         mouseevent = event.mouseevent
@@ -749,7 +929,7 @@ class ClickableImage(object):
         **kwargs : dict
             Arguments are passed to imshow in displaying the bg image.
         """
-        from matplotlib.pyplot import subplots, show
+        from matplotlib.pyplot import subplots
         f, ax = subplots()
         ax.imshow(self.imdata, extent=(0, self.xmax, 0, self.ymax), **kwargs)
         xlim, ylim = [ax.get_xlim(), ax.get_ylim()]
@@ -760,7 +940,7 @@ class ClickableImage(object):
             ax.annotate(txt, coord, fontsize=20, color='r')
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
-        show()
+        plt_show()
 
     def to_layout(self, **kwargs):
         """Turn coordinates into an MNE Layout object.
@@ -772,13 +952,13 @@ class ClickableImage(object):
         **kwargs : dict
             Arguments are passed to generate_2d_layout
         """
-        from mne.channels.layout import generate_2d_layout
+        from ..channels.layout import generate_2d_layout
         coords = np.array(self.coords)
         lt = generate_2d_layout(coords, bg_image=self.imdata, **kwargs)
         return lt
 
 
-def _fake_click(fig, ax, point, xform='ax'):
+def _fake_click(fig, ax, point, xform='ax', button=1, kind='press'):
     """Helper to fake a click at a relative point within axes."""
     if xform == 'ax':
         x, y = ax.transAxes.transform_point(point)
@@ -786,10 +966,17 @@ def _fake_click(fig, ax, point, xform='ax'):
         x, y = ax.transData.transform_point(point)
     else:
         raise ValueError('unknown transform')
+    if kind == 'press':
+        func = partial(fig.canvas.button_press_event, x=x, y=y, button=button)
+    elif kind == 'release':
+        func = partial(fig.canvas.button_release_event, x=x, y=y,
+                       button=button)
+    elif kind == 'motion':
+        func = partial(fig.canvas.motion_notify_event, x=x, y=y)
     try:
-        fig.canvas.button_press_event(x, y, 1, False, None)
+        func(guiEvent=None)
     except Exception:  # for old MPL
-        fig.canvas.button_press_event(x, y, 1, False)
+        func()
 
 
 def add_background_image(fig, im, set_ratios=None):
@@ -805,20 +992,20 @@ def add_background_image(fig, im, set_ratios=None):
 
     Parameters
     ----------
-    fig: plt.figure
+    fig : plt.figure
         The figure you wish to add a bg image to.
-    im: ndarray
+    im : ndarray
         A numpy array that works with a call to
         plt.imshow(im). This will be plotted
         as the background of the figure.
-    set_ratios: None | str
+    set_ratios : None | str
         Set the aspect ratio of any axes in fig
         to the value in set_ratios. Defaults to None,
         which does nothing to axes.
 
     Returns
     -------
-    ax_im: instance of the create matplotlib axis object
+    ax_im : instance of the created matplotlib axis object
         corresponding to the image you added.
 
     Notes
@@ -830,7 +1017,408 @@ def add_background_image(fig, im, set_ratios=None):
         for ax in fig.axes:
             ax.set_aspect(set_ratios)
 
-    ax_im = fig.add_axes([0, 0, 1, 1])
+    ax_im = fig.add_axes([0, 0, 1, 1], label='background')
     ax_im.imshow(im, aspect='auto')
     ax_im.set_zorder(-1)
     return ax_im
+
+
+def _find_peaks(evoked, npeaks):
+    """Helper function for finding peaks from evoked data
+    Returns ``npeaks`` biggest peaks as a list of time points.
+    """
+    argrelmax = _get_argrelmax()
+    gfp = evoked.data.std(axis=0)
+    order = len(evoked.times) // 30
+    if order < 1:
+        order = 1
+    peaks = argrelmax(gfp, order=order, axis=0)[0]
+    if len(peaks) > npeaks:
+        max_indices = np.argsort(gfp[peaks])[-npeaks:]
+        peaks = np.sort(peaks[max_indices])
+    times = evoked.times[peaks]
+    if len(times) == 0:
+        times = [evoked.times[gfp.argmax()]]
+    return times
+
+
+def _process_times(inst, times, n_peaks=None, few=False):
+    """Helper to return a list of times for topomaps"""
+    if isinstance(times, string_types):
+        if times == "peaks":
+            if n_peaks is None:
+                n_peaks = 3 if few else 7
+            times = _find_peaks(inst, n_peaks)
+        elif times == "auto":
+            if n_peaks is None:
+                n_peaks = 5 if few else 10
+            times = np.linspace(inst.times[0], inst.times[-1], n_peaks)
+        else:
+            raise ValueError("Got an unrecognized method for `times`. Only "
+                             "'peaks' and 'auto' are supported (or directly "
+                             "passing numbers).")
+    elif np.isscalar(times):
+        times = [times]
+
+    times = np.array(times)
+
+    if times.ndim != 1:
+        raise ValueError('times must be 1D, got %d dimensions' % times.ndim)
+    if len(times) > 20:
+        raise RuntimeError('Too many plots requested. Please pass fewer '
+                           'than 20 time instants.')
+
+    return times
+
+
+def plot_sensors(info, kind='topomap', ch_type=None, title=None,
+                 show_names=False, ch_groups=None, axes=None, show=True):
+    """Plot sensors positions.
+
+    Parameters
+    ----------
+    info : Instance of Info
+        Info structure containing the channel locations.
+    kind : str
+        Whether to plot the sensors as 3d or as topomap. Available options
+        'topomap', '3d'. Defaults to 'topomap'.
+    ch_type : 'mag' | 'grad' | 'eeg' | 'seeg' | None
+        The channel type to plot. If None, then channels are chosen in the
+        order given above.
+    title : str | None
+        Title for the figure. If None (default), equals to
+        ``'Sensor positions (%s)' % ch_type``.
+    show_names : bool
+        Whether to display all channel names. Defaults to False.
+    ch_groups : 'position' | array of shape (ch_groups, picks) | None
+        Channel groups for coloring the sensors. If None (default), default
+        coloring scheme is used. If 'position', the sensors are divided
+        into 8 regions. See ``order`` kwarg of :func:`mne.viz.plot_raw`. If
+        array, the channels are divided by picks given in the array.
+
+        .. versionadded:: 0.13.0
+
+    axes : instance of Axes | instance of Axes3D | None
+        Axes to draw the sensors to. If ``kind='3d'``, axes must be an instance
+        of Axes3D. If None (default), a new axes will be created.
+
+        .. versionadded:: 0.13.0
+
+    show : bool
+        Show figure if True. Defaults to True.
+
+    Returns
+    -------
+    fig : instance of matplotlib figure
+        Figure containing the sensor topography.
+
+    See Also
+    --------
+    mne.viz.plot_layout
+
+    Notes
+    -----
+    This function plots the sensor locations from the info structure using
+    matplotlib. For drawing the sensors using mayavi see
+    :func:`mne.viz.plot_trans`.
+
+    .. versionadded:: 0.12.0
+
+    """
+    from .evoked import _rgb
+    if kind not in ['topomap', '3d']:
+        raise ValueError("Kind must be 'topomap' or '3d'.")
+    if not isinstance(info, Info):
+        raise TypeError('info must be an instance of Info not %s' % type(info))
+    ch_indices = channel_indices_by_type(info)
+    allowed_types = ['mag', 'grad', 'eeg', 'seeg']
+    if ch_type is None:
+        for this_type in allowed_types:
+            if _contains_ch_type(info, this_type):
+                ch_type = this_type
+                break
+    elif ch_type not in allowed_types:
+        raise ValueError("ch_type must be one of %s not %s!" % (allowed_types,
+                                                                ch_type))
+    picks = ch_indices[ch_type]
+    if len(picks) == 0:
+        raise ValueError('Could not find any channels of type %s.' % ch_type)
+
+    pos = np.asarray([ch['loc'][:3] for ch in info['chs']])[picks]
+    ch_names = np.array(info['ch_names'])[picks]
+    bads = [idx for idx, name in enumerate(ch_names) if name in info['bads']]
+    if ch_groups is None:
+        def_colors = _handle_default('color')
+        colors = ['red' if i in bads else def_colors[channel_type(info, pick)]
+                  for i, pick in enumerate(picks)]
+    else:
+        if ch_groups in ['position', 'selection']:
+            if ch_groups == 'position':
+                ch_groups = _divide_to_regions(info, add_stim=False)
+                ch_groups = list(ch_groups.values())
+            else:
+                ch_groups, color_vals = list(), list()
+                for selection in _SELECTIONS + _EEG_SELECTIONS:
+                    channels = pick_channels(
+                        info['ch_names'], read_selection(selection, info=info))
+                    ch_groups.append(channels)
+            color_vals = np.ones((len(ch_groups), 4))
+            for idx, ch_group in enumerate(ch_groups):
+                color_picks = [np.where(picks == ch)[0][0] for ch in ch_group
+                               if ch in picks]
+                if len(color_picks) == 0:
+                    continue
+                x, y, z = pos[color_picks].T
+                color = np.mean(_rgb(info, x, y, z), axis=0)
+                color_vals[idx, :3] = color  # mean of spatial color
+        else:
+            import matplotlib.pyplot as plt
+            colors = np.linspace(0, 1, len(ch_groups))
+            color_vals = [plt.cm.jet(colors[i]) for i in range(len(ch_groups))]
+        if not isinstance(ch_groups, (np.ndarray, list)):
+            raise ValueError("ch_groups must be None, 'position', "
+                             "'selection', or an array. Got %s." % ch_groups)
+        colors = np.zeros((len(picks), 4))
+        for pick_idx, pick in enumerate(picks):
+            for ind, value in enumerate(ch_groups):
+                if pick in value:
+                    colors[pick_idx] = color_vals[ind]
+                    break
+    if kind == 'topomap':
+        pos = _auto_topomap_coords(info, picks, True)
+
+    title = 'Sensor positions (%s)' % ch_type if title is None else title
+    fig = _plot_sensors(pos, colors, bads, ch_names, title, show_names, axes,
+                        show)
+    return fig
+
+
+def _onpick_sensor(event, fig, ax, pos, ch_names):
+    """Callback for picked channel in plot_sensors."""
+    ind = event.ind[0]  # Just take the first sensor.
+    ch_name = ch_names[ind]
+    this_pos = pos[ind]
+
+    # XXX: Bug in matplotlib won't allow setting the position of existing
+    # text item, so we create a new one.
+    ax.texts.pop(0)
+    if len(this_pos) == 3:
+        ax.text(this_pos[0], this_pos[1], this_pos[2], ch_name)
+    else:
+        ax.text(this_pos[0], this_pos[1], ch_name)
+    fig.canvas.draw()
+
+
+def _plot_sensors(pos, colors, bads, ch_names, title, show_names, ax, show):
+    """Helper function for plotting sensors."""
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    from .topomap import _check_outlines, _draw_outlines
+    edgecolors = np.repeat('black', len(colors))
+    edgecolors[bads] = 'red'
+    if ax is None:
+        fig = plt.figure()
+        if pos.shape[1] == 3:
+            Axes3D(fig)
+            ax = fig.gca(projection='3d')
+        else:
+            ax = fig.add_subplot(111)
+    else:
+        fig = ax.get_figure()
+
+    if pos.shape[1] == 3:
+        ax.text(0, 0, 0, '', zorder=1)
+        ax.scatter(pos[:, 0], pos[:, 1], pos[:, 2], picker=True, c=colors,
+                   s=75, edgecolor=edgecolors, linewidth=2)
+        ax.azim = 90
+        ax.elev = 0
+    else:
+        ax.text(0, 0, '', zorder=1)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.subplots_adjust(left=0, bottom=0, right=1, top=1, wspace=None,
+                            hspace=None)
+        pos, outlines = _check_outlines(pos, 'head')
+        _draw_outlines(ax, outlines)
+        ax.scatter(pos[:, 0], pos[:, 1], picker=True, c=colors, s=75,
+                   edgecolor=edgecolors, linewidth=2)
+
+    if show_names:
+        for idx in range(len(pos)):
+            this_pos = pos[idx]
+            if pos.shape[1] == 3:
+                ax.text(this_pos[0], this_pos[1], this_pos[2], ch_names[idx])
+            else:
+                ax.text(this_pos[0], this_pos[1], ch_names[idx])
+    else:
+        picker = partial(_onpick_sensor, fig=fig, ax=ax, pos=pos,
+                         ch_names=ch_names)
+        fig.canvas.mpl_connect('pick_event', picker)
+
+    fig.suptitle(title)
+    plt_show(show)
+    return fig
+
+
+def _compute_scalings(scalings, inst):
+    """Compute scalings for each channel type automatically.
+
+    Parameters
+    ----------
+    scalings : dict
+        The scalings for each channel type. If any values are
+        'auto', this will automatically compute a reasonable
+        scaling for that channel type. Any values that aren't
+        'auto' will not be changed.
+    inst : instance of Raw or Epochs
+        The data for which you want to compute scalings. If data
+        is not preloaded, this will read a subset of times / epochs
+        up to 100mb in size in order to compute scalings.
+
+    Returns
+    -------
+    scalings : dict
+        A scalings dictionary with updated values
+    """
+    from ..io.base import _BaseRaw
+    from ..epochs import _BaseEpochs
+    if not isinstance(inst, (_BaseRaw, _BaseEpochs)):
+        raise ValueError('Must supply either Raw or Epochs')
+    if scalings is None:
+        # If scalings is None just return it and do nothing
+        return scalings
+
+    ch_types = channel_indices_by_type(inst.info)
+    ch_types = dict([(i_type, i_ixs)
+                     for i_type, i_ixs in ch_types.items() if len(i_ixs) != 0])
+    if scalings == 'auto':
+        # If we want to auto-compute everything
+        scalings = dict((i_type, 'auto') for i_type in ch_types.keys())
+    if not isinstance(scalings, dict):
+        raise ValueError('scalings must be a dictionary of ch_type: val pairs,'
+                         ' not type %s ' % type(scalings))
+    scalings = deepcopy(scalings)
+
+    if inst.preload is False:
+        if isinstance(inst, _BaseRaw):
+            # Load a window of data from the center up to 100mb in size
+            n_times = 1e8 // (len(inst.ch_names) * 8)
+            n_times = np.clip(n_times, 1, inst.n_times)
+            n_secs = n_times / float(inst.info['sfreq'])
+            time_middle = np.mean(inst.times)
+            tmin = np.clip(time_middle - n_secs / 2., inst.times.min(), None)
+            tmax = np.clip(time_middle + n_secs / 2., None, inst.times.max())
+            data = inst._read_segment(tmin, tmax)
+        elif isinstance(inst, _BaseEpochs):
+            # Load a random subset of epochs up to 100mb in size
+            n_epochs = 1e8 // (len(inst.ch_names) * len(inst.times) * 8)
+            n_epochs = int(np.clip(n_epochs, 1, len(inst)))
+            ixs_epochs = np.random.choice(range(len(inst)), n_epochs, False)
+            inst = inst.copy()[ixs_epochs].load_data()
+    else:
+        data = inst._data
+    if isinstance(inst, _BaseEpochs):
+        data = inst._data.reshape([len(inst.ch_names), -1])
+    # Iterate through ch types and update scaling if ' auto'
+    for key, value in scalings.items():
+        if value != 'auto':
+            continue
+        if key not in ch_types.keys():
+            raise ValueError("Sensor {0} doesn't exist in data".format(key))
+        this_data = data[ch_types[key]]
+        scale_factor = np.percentile(this_data.ravel(), [0.5, 99.5])
+        scale_factor = np.max(np.abs(scale_factor))
+        scalings[key] = scale_factor
+    return scalings
+
+
+class DraggableColorbar(object):
+    """Class for enabling interactive colorbar.
+    See http://www.ster.kuleuven.be/~pieterd/python/html/plotting/interactive_colorbar.html
+    """  # noqa
+    def __init__(self, cbar, mappable):
+        import matplotlib.pyplot as plt
+        self.cbar = cbar
+        self.mappable = mappable
+        self.press = None
+        self.cycle = sorted([i for i in dir(plt.cm) if
+                             hasattr(getattr(plt.cm, i), 'N')])
+        self.index = self.cycle.index(cbar.get_cmap().name)
+        self.lims = (self.cbar.norm.vmin, self.cbar.norm.vmax)
+        self.connect()
+
+    def connect(self):
+        """Connect to all the events we need."""
+        self.cidpress = self.cbar.patch.figure.canvas.mpl_connect(
+            'button_press_event', self.on_press)
+        self.cidrelease = self.cbar.patch.figure.canvas.mpl_connect(
+            'button_release_event', self.on_release)
+        self.cidmotion = self.cbar.patch.figure.canvas.mpl_connect(
+            'motion_notify_event', self.on_motion)
+        self.keypress = self.cbar.patch.figure.canvas.mpl_connect(
+            'key_press_event', self.key_press)
+        self.scroll = self.cbar.patch.figure.canvas.mpl_connect(
+            'scroll_event', self.on_scroll)
+
+    def on_press(self, event):
+        """Callback for button press."""
+        if event.inaxes != self.cbar.ax:
+            return
+        self.press = event.y
+
+    def key_press(self, event):
+        """Callback for key press."""
+        if event.key == 'down':
+            self.index += 1
+        elif event.key == 'up':
+            self.index -= 1
+        elif event.key == ' ':  # space key resets scale
+            self.cbar.norm.vmin = self.lims[0]
+            self.cbar.norm.vmax = self.lims[1]
+        else:
+            return
+        if self.index < 0:
+            self.index = len(self.cycle) - 1
+        elif self.index >= len(self.cycle):
+            self.index = 0
+        cmap = self.cycle[self.index]
+        self.cbar.set_cmap(cmap)
+        self.cbar.draw_all()
+        self.mappable.set_cmap(cmap)
+        self.cbar.patch.figure.canvas.draw()
+
+    def on_motion(self, event):
+        """Callback for mouse movements."""
+        if self.press is None:
+            return
+        if event.inaxes != self.cbar.ax:
+            return
+        yprev = self.press
+        dy = event.y - yprev
+        self.press = event.y
+        scale = self.cbar.norm.vmax - self.cbar.norm.vmin
+        perc = 0.03
+        if event.button == 1:
+            self.cbar.norm.vmin -= (perc * scale) * np.sign(dy)
+            self.cbar.norm.vmax -= (perc * scale) * np.sign(dy)
+        elif event.button == 3:
+            self.cbar.norm.vmin -= (perc * scale) * np.sign(dy)
+            self.cbar.norm.vmax += (perc * scale) * np.sign(dy)
+        self.cbar.draw_all()
+        self.mappable.set_norm(self.cbar.norm)
+        self.cbar.patch.figure.canvas.draw()
+
+    def on_release(self, event):
+        """Callback for release."""
+        self.press = None
+        self.mappable.set_norm(self.cbar.norm)
+        self.cbar.patch.figure.canvas.draw()
+
+    def on_scroll(self, event):
+        """Callback for scroll."""
+        scale = 1.1 if event.step < 0 else 1. / 1.1
+        self.cbar.norm.vmin *= scale
+        self.cbar.norm.vmax *= scale
+        self.cbar.draw_all()
+        self.mappable.set_norm(self.cbar.norm)
+        self.cbar.patch.figure.canvas.draw()

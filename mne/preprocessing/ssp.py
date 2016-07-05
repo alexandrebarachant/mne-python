@@ -5,11 +5,11 @@
 # License: BSD (3-clause)
 
 import copy as cp
-from warnings import warn
+
 import numpy as np
 
 from .. import Epochs, compute_proj_evoked, compute_proj_epochs
-from ..utils import logger, verbose
+from ..utils import logger, verbose, warn
 from .. import pick_types
 from ..io import make_eeg_average_ref_proj
 from .ecg import find_ecg_events
@@ -35,8 +35,7 @@ def _compute_exg_proj(mode, raw, raw_event, tmin, tmax,
                       filter_method, iir_params=None, verbose=None):
     """Compute SSP/PCA projections for ECG or EOG artifacts
 
-    Note: raw has to be constructed with preload=True (or string)
-    Warning: raw will be modified by this function
+    .. note:: raw data must be preloaded.
 
     Parameters
     ----------
@@ -186,7 +185,7 @@ def _compute_exg_proj(mode, raw, raw_event, tmin, tmax,
     epochs = Epochs(raw, events, None, tmin, tmax, baseline=None, preload=True,
                     picks=picks, reject=reject, flat=flat, proj=True)
 
-    epochs.drop_bad_epochs()
+    epochs.drop_bad()
     if epochs.events.shape[0] < 1:
         warn('No good epochs found, returning None for projs')
         return None, events
@@ -221,8 +220,7 @@ def compute_proj_ecg(raw, raw_event=None, tmin=-0.2, tmax=0.4,
                      iir_params=None, copy=True, verbose=None):
     """Compute SSP/PCA projections for ECG artifacts
 
-    Note: raw has to be constructed with preload=True (or string)
-    Warning: raw will be modified by this function
+    .. note:: raw data must be preloaded.
 
     Parameters
     ----------
@@ -317,8 +315,7 @@ def compute_proj_eog(raw, raw_event=None, tmin=-0.2, tmax=0.2,
                      iir_params=None, ch_name=None, copy=True, verbose=None):
     """Compute SSP/PCA projections for EOG artifacts
 
-    Note: raw has to be constructed with preload=True (or string)
-    Warning: raw will be modified by this function
+    .. note:: raw data must be preloaded.
 
     Parameters
     ----------

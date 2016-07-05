@@ -7,9 +7,10 @@ import warnings
 
 from numpy.testing import assert_raises
 
-from mne import io, read_events, pick_types
-from mne.utils import requires_scipy_version, run_tests_if_main
+from mne import io, read_events, pick_types, Annotations
+from mne.utils import requires_version, run_tests_if_main
 from mne.viz.utils import _fake_click
+from mne.viz import plot_raw, plot_sensors
 
 # Set our plotters to test mode
 import matplotlib
@@ -23,8 +24,12 @@ event_name = op.join(base_dir, 'test-eve.fif')
 
 
 def _get_raw():
-    raw = io.Raw(raw_fname, preload=True)
+    raw = io.read_raw_fif(raw_fname, preload=True)
+    # Throws a warning about a changed unit.
+    with warnings.catch_warnings(record=True):
+        raw.set_channel_types({raw.ch_names[0]: 'ias'})
     raw.pick_channels(raw.ch_names[:9])
+    raw.info.normalize_proj()  # Fix projectors after subselection
     return raw
 
 
@@ -33,8 +38,7 @@ def _get_events():
 
 
 def test_plot_raw():
-    """Test plotting of raw data
-    """
+    """Test plotting of raw data."""
     import matplotlib.pyplot as plt
     raw = _get_raw()
     events = _get_events()
@@ -85,14 +89,34 @@ def test_plot_raw():
         # Color setting
         assert_raises(KeyError, raw.plot, event_color={0: 'r'})
         assert_raises(TypeError, raw.plot, event_color={'foo': 'r'})
-        fig = raw.plot(events=events, event_color={-1: 'r', 998: 'b'})
+        annot = Annotations([10, 10 + raw.first_samp / raw.info['sfreq']],
+                            [10, 10], ['test', 'test'], raw.info['meas_date'])
+        raw.annotations = annot
+        fig = plot_raw(raw, events=events, event_color={-1: 'r', 998: 'b'})
         plt.close('all')
+        for order in ['position', 'selection', range(len(raw.ch_names))[::-1],
+                      [1, 2, 4, 6]]:
+            fig = raw.plot(order=order)
+            x = fig.get_axes()[0].lines[1].get_xdata()[10]
+            y = fig.get_axes()[0].lines[1].get_ydata()[10]
+            _fake_click(fig, data_ax, [x, y], xform='data')  # mark bad
+            fig.canvas.key_press_event('down')  # change selection
+            _fake_click(fig, fig.get_axes()[2], [0.5, 0.5])  # change channels
+            if order == 'position':  # test clicking topo to change selection
+                sel_fig = plt.figure(1)
+                topo_ax = sel_fig.axes[1]
+                _fake_click(sel_fig, topo_ax, [-0.425, 0.20223853],
+                            xform='data')
+                fig.canvas.key_press_event('down')
+                fig.canvas.key_press_event('up')
+                fig.canvas.scroll_event(0.5, 0.5, -1)  # scroll down
+                fig.canvas.scroll_event(0.5, 0.5, 1)  # scroll up
+            plt.close('all')
 
 
-@requires_scipy_version('0.10')
+@requires_version('scipy', '0.10')
 def test_plot_raw_filtered():
-    """Test filtering of raw plots
-    """
+    """Test filtering of raw plots."""
     raw = _get_raw()
     assert_raises(ValueError, raw.plot, lowpass=raw.info['sfreq'] / 2.)
     assert_raises(ValueError, raw.plot, highpass=0)
@@ -104,10 +128,9 @@ def test_plot_raw_filtered():
     raw.plot(highpass=1, lowpass=2)
 
 
-@requires_scipy_version('0.12')
+@requires_version('scipy', '0.12')
 def test_plot_raw_psd():
-    """Test plotting of raw psds
-    """
+    """Test plotting of raw psds."""
     import matplotlib.pyplot as plt
     raw = _get_raw()
     # normal mode
@@ -116,10 +139,36 @@ def test_plot_raw_psd():
     picks = pick_types(raw.info, meg='mag', eeg=False)[:4]
     raw.plot_psd(picks=picks, area_mode='range')
     ax = plt.axes()
-    # if ax is supplied, picks must be, too:
+    # if ax is supplied:
     assert_raises(ValueError, raw.plot_psd, ax=ax)
     raw.plot_psd(picks=picks, ax=ax)
     plt.close('all')
+    ax = plt.axes()
+    assert_raises(ValueError, raw.plot_psd, ax=ax)
+    ax = [ax, plt.axes()]
+    raw.plot_psd(ax=ax)
+    plt.close('all')
+    # topo psd
+    raw.plot_psd_topo()
+    plt.close('all')
+    # with a flat channel
+    raw[5, :] = 0
+    assert_raises(ValueError, raw.plot_psd)
 
+
+def test_plot_sensors():
+    """Test plotting of sensor array."""
+    import matplotlib.pyplot as plt
+    raw = _get_raw()
+    fig = raw.plot_sensors('3d')
+    _fake_click(fig, fig.gca(), (-0.08, 0.67))
+    raw.plot_sensors('topomap')
+    ax = plt.subplot(111)
+    raw.plot_sensors(ch_groups='position', axes=ax)
+    raw.plot_sensors(ch_groups='selection')
+    raw.plot_sensors(ch_groups=[[0, 1, 2], [3, 4]])
+    assert_raises(ValueError, raw.plot_sensors, ch_groups='asd')
+    assert_raises(TypeError, plot_sensors, raw)  # needs to be info
+    plt.close('all')
 
 run_tests_if_main()

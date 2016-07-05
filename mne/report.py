@@ -14,7 +14,6 @@ import re
 import codecs
 import time
 from glob import glob
-import warnings
 import base64
 from datetime import datetime as dt
 
@@ -22,7 +21,7 @@ import numpy as np
 
 from . import read_evokeds, read_events, pick_types, read_cov
 from .io import Raw, read_info
-from .utils import _TempDir, logger, verbose, get_subjects_dir
+from .utils import _TempDir, logger, verbose, get_subjects_dir, warn
 from .viz import plot_events, plot_trans, plot_cov
 from .viz._3d import _plot_mri_contours
 from .forward import read_forward_solution
@@ -49,7 +48,33 @@ SECTION_ORDER = ['raw', 'events', 'epochs', 'evoked', 'covariance', 'trans',
 def _fig_to_img(function=None, fig=None, image_format='png',
                 scale=None, **kwargs):
     """Wrapper function to plot figure and create a binary image"""
+
     import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
+    if not isinstance(fig, Figure) and function is None:
+        from scipy.misc import imread
+        mayavi = None
+        try:
+            from mayavi import mlab  # noqa, mlab imported
+            import mayavi
+        except:  # on some systems importing Mayavi raises SystemExit (!)
+            warn('Could not import mayavi. Trying to render'
+                 '`mayavi.core.scene.Scene` figure instances'
+                 ' will throw an error.')
+        tempdir = _TempDir()
+        temp_fname = op.join(tempdir, 'test')
+        if fig.scene is not None:
+            fig.scene.save_png(temp_fname)
+            img = imread(temp_fname)
+            os.remove(temp_fname)
+        else:  # Testing mode
+            img = np.zeros((2, 2, 3))
+
+        mayavi.mlab.close(fig)
+        fig = plt.figure()
+        plt.imshow(img)
+        plt.axis('off')
+
     if function is not None:
         plt.close('all')
         fig = function(**kwargs)
@@ -272,7 +297,7 @@ def _iterate_files(report, fnames, info, cov, baseline, sfreq, on_error):
                 report_sectionlabel = None
         except Exception as e:
             if on_error == 'warn':
-                logger.warning('Failed to process file %s:\n"%s"' % (fname, e))
+                warn('Failed to process file %s:\n"%s"' % (fname, e))
             elif on_error == 'raise':
                 raise
             html = None
@@ -390,17 +415,38 @@ slider_template = HTMLTemplate(u"""
                        })</script>
 """)
 
+slider_full_template = Template(u"""
+<li class="{{div_klass}}" id="{{id}}">
+<h4>{{title}}</h4>
+<div class="thumbnail">
+    <ul><li class="slider">
+        <div class="row">
+            <div class="col-md-6 col-md-offset-3">
+                <div id="{{slider_id}}"></div>
+                <ul class="thumbnails">
+                    {{image_html}}
+                </ul>
+                {{html}}
+            </div>
+        </div>
+    </li></ul>
+</div>
+</li>
+""")
 
-def _build_html_slider(slices_range, slides_klass, slider_id):
+
+def _build_html_slider(slices_range, slides_klass, slider_id,
+                       start_value=None):
     """Build an html slider for a given slices range and a slices klass.
     """
-    startvalue = slices_range[len(slices_range) // 2]
+    if start_value is None:
+        start_value = slices_range[len(slices_range) // 2]
     return slider_template.substitute(slider_id=slider_id,
                                       klass=slides_klass,
                                       step=slices_range[1] - slices_range[0],
                                       minvalue=slices_range[0],
                                       maxvalue=slices_range[-1],
-                                      startvalue=startvalue)
+                                      startvalue=start_value)
 
 
 ###############################################################################
@@ -551,7 +597,7 @@ div.footer {
 footer_template = HTMLTemplate(u"""
 </div></body>
 <div class="footer">
-        &copy; Copyright 2012-2013, MNE Developers.
+        &copy; Copyright 2012-{{current_year}}, MNE Developers.
       Created on {{date}}.
       Powered by <a href="http://martinos.org/mne">MNE.
 </div>
@@ -589,6 +635,14 @@ image_template = Template(u"""
         {{else}}
             <img alt=""
              src="data:image/png;base64,{{img}}">
+        {{endif}}
+    {{elif image_format == 'gif'}}
+        {{if scale is not None}}
+            <img alt="" style="width:{{width}}%;"
+             src="data:image/gif;base64,{{img}}">
+        {{else}}
+            <img alt=""
+             src="data:image/gif;base64,{{img}}">
         {{endif}}
     {{elif image_format == 'svg'}}
         <div style="text-align:center;">
@@ -796,17 +850,7 @@ class Report(object):
                              image_format='png', scale=None, comments=None):
         """Auxiliary method for `add_section` and `add_figs_to_section`.
         """
-        from scipy.misc import imread
-        import matplotlib.pyplot as plt
-        mayavi = None
-        try:
-            # on some version mayavi.core won't be exposed unless ...
-            from mayavi import mlab  # noqa, mlab imported
-            import mayavi
-        except:  # on some systems importing Mayavi raises SystemExit (!)
-            warnings.warn('Could not import mayavi. Trying to render '
-                          '`mayavi.core.scene.Scene` figure instances'
-                          ' will throw an error.')
+
         figs, captions, comments = self._validate_input(figs, captions,
                                                         section, comments)
         _check_scale(scale)
@@ -816,20 +860,6 @@ class Report(object):
             global_id = self._get_id()
             div_klass = self._sectionvars[section]
             img_klass = self._sectionvars[section]
-
-            if mayavi is not None and isinstance(fig, mayavi.core.scene.Scene):
-                tempdir = _TempDir()
-                temp_fname = op.join(tempdir, 'test')
-                if fig.scene is not None:
-                    fig.scene.save_png(temp_fname)
-                    img = imread(temp_fname)
-                else:  # Testing mode
-                    img = np.zeros((2, 2, 3))
-
-                mayavi.mlab.close(fig)
-                fig = plt.figure()
-                plt.imshow(img)
-                plt.axis('off')
 
             img = _fig_to_img(fig=fig, scale=scale,
                               image_format=image_format)
@@ -884,6 +914,7 @@ class Report(object):
         ----------
         fnames : str | list of str
             A filename or a list of filenames from which images are read.
+            Images can be PNG, GIF or SVG.
         captions : str | list of str
             A caption or a list of captions to the images.
         scale : float | None
@@ -899,7 +930,6 @@ class Report(object):
         # Note: using scipy.misc is equivalent because scipy internally
         # imports PIL anyway. It's not possible to redirect image output
         # to binary string using scipy.misc.
-        from PIL import Image
         fnames, captions, comments = self._validate_input(fnames, captions,
                                                           section, comments)
         _check_scale(scale)
@@ -911,12 +941,20 @@ class Report(object):
             div_klass = self._sectionvars[section]
             img_klass = self._sectionvars[section]
 
+            image_format = os.path.splitext(fname)[1][1:]
+            image_format = image_format.lower()
+
+            if image_format not in ['png', 'gif', 'svg']:
+                raise ValueError("Unknown image format. Only 'png', 'gif' or "
+                                 "'svg' are supported. Got %s" % image_format)
+
             # Convert image to binary string.
-            im = Image.open(fname)
             output = BytesIO()
-            im.save(output, format='png')
+            with open(fname, 'rb') as f:
+                output.write(f.read())
             img = base64.b64encode(output.getvalue()).decode('ascii')
             html = image_template.substitute(img=img, id=global_id,
+                                             image_format=image_format,
                                              div_klass=div_klass,
                                              img_klass=img_klass,
                                              caption=caption,
@@ -993,6 +1031,97 @@ class Report(object):
         self.fnames.append('%s-#-%s-#-custom' % (caption[0], sectionvar))
         self._sectionlabels.append(sectionvar)
         self.html.extend(html)
+
+    def add_slider_to_section(self, figs, captions=None, section='custom',
+                              title='Slider', scale=None, image_format='png'):
+        """Renders a slider of figs to the report.
+
+        Parameters
+        ----------
+        figs : list of figures.
+            Each figure in the list can be an instance of
+            matplotlib.pyplot.Figure, mayavi.core.scene.Scene,
+            or np.ndarray (images read in using scipy.imread).
+        captions : list of str | list of float | None
+            A list of captions to the figures. If float, a str will be
+            constructed as `%f s`. If None, it will default to
+            `Data slice %d`.
+        section : str
+            Name of the section. If section already exists, the figures
+            will be appended to the end of the section.
+        title : str
+            The title of the slider.
+        scale : float | None | callable
+            Scale the images maintaining the aspect ratio.
+            If None, no scaling is applied. If float, scale will determine
+            the relative scaling (might not work for scale <= 1 depending on
+            font sizes). If function, should take a figure object as input
+            parameter. Defaults to None.
+        image_format : {'png', 'svg'}
+            The image format to be used for the report. Defaults to 'png'.
+
+        Notes
+        -----
+        .. versionadded:: 0.10.0
+        """
+
+        _check_scale(scale)
+        if not isinstance(figs[0], list):
+            figs = [figs]
+        else:
+            raise NotImplementedError('`add_slider_to_section` '
+                                      'can only add one slider at a time.')
+        figs, _, _ = self._validate_input(figs, section, section)
+
+        sectionvar = self._sectionvars[section]
+        self._sectionlabels.append(sectionvar)
+        global_id = self._get_id()
+        img_klass = self._sectionvars[section]
+        name = 'slider'
+
+        html = []
+        slides_klass = '%s-%s' % (name, global_id)
+        div_klass = 'span12 %s' % slides_klass
+
+        if isinstance(figs[0], list):
+            figs = figs[0]
+        sl = np.arange(0, len(figs))
+        slices = []
+        img_klass = 'slideimg-%s' % name
+
+        if captions is None:
+            captions = ['Data slice %d' % ii for ii in sl]
+        elif isinstance(captions, (list, tuple, np.ndarray)):
+            if len(figs) != len(captions):
+                raise ValueError('Captions must be the same length as the '
+                                 'number of slides.')
+            if isinstance(captions[0], (float, int)):
+                captions = ['%0.3f s' % caption for caption in captions]
+        else:
+            raise TypeError('Captions must be None or an iterable of '
+                            'float, int, str, Got %s' % type(captions))
+        for ii, (fig, caption) in enumerate(zip(figs, captions)):
+            img = _fig_to_img(fig=fig, scale=scale, image_format=image_format)
+            slice_id = '%s-%s-%s' % (name, global_id, sl[ii])
+            first = True if ii == 0 else False
+            slices.append(_build_html_image(img, slice_id, div_klass,
+                          img_klass, caption, first))
+        # Render the slider
+        slider_id = 'select-%s-%s' % (name, global_id)
+        # Render the slices
+        image_html = u'\n'.join(slices)
+        html.append(_build_html_slider(sl, slides_klass, slider_id,
+                                       start_value=0))
+        html = '\n'.join(html)
+
+        slider_klass = sectionvar
+        self.html.append(
+            slider_full_template.substitute(id=global_id, title=title,
+                                            div_klass=slider_klass,
+                                            slider_id=slider_id, html=html,
+                                            image_html=image_html))
+
+        self.fnames.append('%s-#-%s-#-custom' % (section, sectionvar))
 
     ###########################################################################
     # HTML rendering
@@ -1101,8 +1230,8 @@ class Report(object):
             info = read_info(self.info_fname)
             sfreq = info['sfreq']
         else:
-            warnings.warn('`info_fname` not provided. Cannot render'
-                          '-cov.fif(.gz) and -trans.fif(.gz) files.')
+            warn('`info_fname` not provided. Cannot render -cov.fif(.gz) and '
+                 '-trans.fif(.gz) files.')
             info, sfreq = None, None
 
         cov = None
@@ -1139,8 +1268,8 @@ class Report(object):
             self.fnames.append('bem')
             self._sectionlabels.append('mri')
         else:
-            warnings.warn('`subjects_dir` and `subject` not provided.'
-                          ' Cannot render MRI and -trans.fif(.gz) files.')
+            warn('`subjects_dir` and `subject` not provided. Cannot render '
+                 'MRI and -trans.fif(.gz) files.')
 
     def save(self, fname=None, open_browser=True, overwrite=False):
         """Save html report and open it in browser.
@@ -1158,15 +1287,16 @@ class Report(object):
         if fname is None:
             if not hasattr(self, 'data_path'):
                 self.data_path = op.dirname(__file__)
-                warnings.warn('`data_path` not provided. Using %s instead'
-                              % self.data_path)
+                warn('`data_path` not provided. Using %s instead'
+                     % self.data_path)
             fname = op.realpath(op.join(self.data_path, 'report.html'))
         else:
             fname = op.realpath(fname)
 
         self._render_toc()
 
-        html = footer_template.substitute(date=time.strftime("%B %d, %Y"))
+        html = footer_template.substitute(date=time.strftime("%B %d, %Y"),
+                                          current_year=time.strftime("%Y"))
         self.html.append(html)
 
         if not overwrite and op.isfile(fname):
@@ -1600,26 +1730,26 @@ class Report(object):
         # Get the MRI filename
         mri_fname = op.join(subjects_dir, subject, 'mri', 'T1.mgz')
         if not op.isfile(mri_fname):
-            warnings.warn('MRI file "%s" does not exist' % mri_fname)
+            warn('MRI file "%s" does not exist' % mri_fname)
 
         # Get the BEM surface filenames
         bem_path = op.join(subjects_dir, subject, 'bem')
 
         if not op.isdir(bem_path):
-            warnings.warn('Subject bem directory "%s" does not exist' %
-                          bem_path)
+            warn('Subject bem directory "%s" does not exist' % bem_path)
             return self._render_image(mri_fname, cmap='gray', n_jobs=n_jobs)
 
         surf_fnames = []
         for surf_name in ['*inner_skull', '*outer_skull', '*outer_skin']:
             surf_fname = glob(op.join(bem_path, surf_name + '.surf'))
             if len(surf_fname) > 0:
-                surf_fname = surf_fname[0]
+                surf_fnames.append(surf_fname[0])
             else:
-                warnings.warn('No surface found for %s.' % surf_name)
-                return self._render_image(mri_fname, cmap='gray')
-            surf_fnames.append(surf_fname)
-
+                warn('No surface found for %s.' % surf_name)
+                continue
+        if len(surf_fnames) == 0:
+            warn('No surfaces found at all, rendering empty MRI')
+            return self._render_image(mri_fname, cmap='gray')
         # XXX : find a better way to get max range of slices
         nim = nib.load(mri_fname)
         data = nim.get_data()

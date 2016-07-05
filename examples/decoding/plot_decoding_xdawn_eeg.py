@@ -4,8 +4,8 @@
 =============================
 
 ERP decoding with Xdawn. For each event type, a set of spatial Xdawn filters
-are trained and apply on the signal. Channels are concatenated and rescaled to
-create features vectors that will be fed into a Logistic Regression.
+are trained and applied on the signal. Channels are concatenated and rescaled
+to create features vectors that will be fed into a Logistic Regression.
 
 References
 ----------
@@ -34,7 +34,7 @@ from sklearn.preprocessing import MinMaxScaler
 from mne import io, pick_types, read_events, Epochs
 from mne.datasets import sample
 from mne.preprocessing import Xdawn
-from mne.decoding import ConcatenateChannels
+from mne.decoding import EpochsVectorizer
 from mne.viz import tight_layout
 
 
@@ -50,7 +50,7 @@ tmin, tmax = -0.1, 0.3
 event_id = dict(aud_l=1, aud_r=2, vis_l=3, vis_r=4)
 
 # Setup for reading the raw data
-raw = io.Raw(raw_fname, preload=True)
+raw = io.read_raw_fif(raw_fname, preload=True)
 raw.filter(1, 20, method='iir')
 events = read_events(event_fname)
 
@@ -63,7 +63,7 @@ epochs = Epochs(raw, events, event_id, tmin, tmax, proj=False,
 
 # Create classification pipeline
 clf = make_pipeline(Xdawn(n_components=3),
-                    ConcatenateChannels(),
+                    EpochsVectorizer(),
                     MinMaxScaler(),
                     LogisticRegression(penalty='l1'))
 

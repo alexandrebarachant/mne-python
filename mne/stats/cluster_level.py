@@ -9,14 +9,14 @@
 #
 # License: Simplified BSD
 
-import numpy as np
-import warnings
 import logging
+
+import numpy as np
 from scipy import sparse
 
 from .parametric import f_oneway
 from ..parallel import parallel_func, check_n_jobs
-from ..utils import split_list, logger, verbose, ProgressBar
+from ..utils import split_list, logger, verbose, ProgressBar, warn
 from ..fixes import in1d, unravel_index
 from ..source_estimate import SourceEstimate
 
@@ -229,14 +229,14 @@ def _get_components(x_in, connectivity, return_list=True):
     connectivity = sparse.coo_matrix((data, (row, col)), shape=shape)
     _, components = cs_graph_components(connectivity)
     if return_list:
-        labels = np.unique(components)
-        clusters = list()
-        for l in labels:
-            c = np.where(components == l)[0]
-            if np.any(x_in[c]):
-                clusters.append(c)
-        # logger.info("-- number of components : %d"
-        #             % np.unique(components).size)
+        start = np.min(components)
+        stop = np.max(components)
+        comp_list = [list() for i in range(start, stop + 1, 1)]
+        mask = np.zeros(len(comp_list), dtype=bool)
+        for ii, comp in enumerate(components):
+            comp_list[comp].append(ii)
+            mask[comp] += x_in[ii]
+        clusters = [np.array(k) for k, m in zip(comp_list, mask) if m]
         return clusters
     else:
         return components
@@ -325,11 +325,9 @@ def _find_clusters(x, threshold, tail=0, connectivity=None, max_step=1,
         e_power = threshold.get('e_power', 0.5)
         if show_info is True:
             if len(thresholds) == 0:
-                txt = ('threshold["start"] (%s) is more extreme than '
-                       'data statistics with most extreme value %s'
-                       % (threshold['start'], stop))
-                logger.warning(txt)
-                warnings.warn(txt)
+                warn('threshold["start"] (%s) is more extreme than data '
+                     'statistics with most extreme value %s'
+                     % (threshold['start'], stop))
             else:
                 logger.info('Using %d thresholds from %0.2f to %0.2f for TFCE '
                             'computation (h_power=%0.2f, e_power=%0.2f)'
@@ -723,8 +721,8 @@ def _permutation_cluster_test(X, threshold, n_permutations, tail, stat_fun,
                 stat_fun(*[x[:, pos: pos + buffer_size] for x in X])
 
         if not np.alltrue(T_obs == T_obs_buffer):
-            logger.warning('Provided stat_fun does not treat variables '
-                           'independently. Setting buffer_size to None.')
+            warn('Provided stat_fun does not treat variables independently. '
+                 'Setting buffer_size to None.')
             buffer_size = None
 
     # The stat should have the same shape as the samples for no conn.
@@ -741,7 +739,7 @@ def _permutation_cluster_test(X, threshold, n_permutations, tail, stat_fun,
         partitions = _get_partitions_from_connectivity(connectivity, n_times)
     else:
         partitions = None
-    logger.info('Running intial clustering')
+    logger.info('Running initial clustering')
     out = _find_clusters(T_obs, threshold, tail, connectivity,
                          max_step=max_step, include=include,
                          partitions=partitions, t_power=t_power,

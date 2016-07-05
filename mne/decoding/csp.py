@@ -1,6 +1,8 @@
+# -*- coding: utf-8 -*-
 # Authors: Romain Trachel <trachelr@gmail.com>
 #          Alexandre Gramfort <alexandre.gramfort@telecom-paristech.fr>
 #          Alexandre Barachant <alexandre.barachant@gmail.com>
+#          Clemens Brunner <clemens.brunner@gmail.com>
 #
 # License: BSD (3-clause)
 
@@ -9,16 +11,17 @@ import copy as cp
 import numpy as np
 from scipy import linalg
 
-from .mixin import TransformerMixin
+from .mixin import TransformerMixin, EstimatorMixin
 from ..cov import _regularized_covariance
 
 
-class CSP(TransformerMixin):
+class CSP(TransformerMixin, EstimatorMixin):
     """M/EEG signal decomposition using the Common Spatial Patterns (CSP).
 
     This object can be used as a supervised decomposition to estimate
     spatial filters for feature extraction in a 2 class decoding problem.
-    See [1].
+    CSP in the context of EEG was first described in [1]; a comprehensive
+    tutorial on CSP can be found in [2].
 
     Parameters
     ----------
@@ -28,39 +31,63 @@ class CSP(TransformerMixin):
     reg : float | str | None (default None)
         if not None, allow regularization for covariance estimation
         if float, shrinkage covariance is used (0 <= shrinkage <= 1).
-        if str, optimal shrinkage using Ledoit-Wolf Shrinkage ('lws') or
-        Oracle Approximating Shrinkage ('oas').
+        if str, optimal shrinkage using Ledoit-Wolf Shrinkage ('ledoit_wolf')
+        or Oracle Approximating Shrinkage ('oas').
     log : bool (default True)
         If true, apply log to standardize the features.
         If false, features are just z-scored.
+    cov_est : str (default 'concat')
+        If 'concat', covariance matrices are estimated on concatenated epochs
+        for each class.
+        If 'epoch', covariance matrices are estimated on each epoch separately
+        and then averaged over each class.
 
     Attributes
     ----------
-    filters_ : ndarray, shape (n_channels, n_channels)
+    ``filters_`` : ndarray, shape (n_channels, n_channels)
         If fit, the CSP components used to decompose the data, else None.
-    patterns_ : ndarray, shape (n_channels, n_channels)
+    ``patterns_`` : ndarray, shape (n_channels, n_channels)
         If fit, the CSP patterns used to restore M/EEG signals, else None.
-    mean_ : ndarray, shape (n_channels,)
+    ``mean_`` : ndarray, shape (n_channels,)
         If fit, the mean squared power for each component.
-    std_ : ndarray, shape (n_channels,)
+    ``std_`` : ndarray, shape (n_channels,)
         If fit, the std squared power for each component.
 
     References
     ----------
-    [1] Zoltan J. Koles. The quantitative extraction and topographic mapping
-    of the abnormal components in the clinical EEG. Electroencephalography
-    and Clinical Neurophysiology, 79(6):440--447, December 1991.
+    [1] Zoltan J. Koles, Michael S. Lazar, Steven Z. Zhou. Spatial Patterns
+        Underlying Population Differences in the Background EEG. Brain
+        Topography 2(4), 275-284, 1990.
+    [2] Benjamin Blankertz, Ryota Tomioka, Steven Lemm, Motoaki Kawanabe,
+        Klaus-Robert Müller. Optimizing Spatial Filters for Robust EEG
+        Single-Trial Analysis. IEEE Signal Processing Magazine 25(1), 41-56,
+        2008.
     """
 
-    def __init__(self, n_components=4, reg=None, log=True):
+    def __init__(self, n_components=4, reg=None, log=True, cov_est="concat"):
         """Init of CSP."""
         self.n_components = n_components
         self.reg = reg
         self.log = log
+        self.cov_est = cov_est
         self.filters_ = None
         self.patterns_ = None
         self.mean_ = None
         self.std_ = None
+
+    def get_params(self, deep=True):
+        """Return all parameters (mimics sklearn API).
+
+        Parameters
+        ----------
+        deep: boolean, optional
+            If True, will return the parameters for this estimator and
+            contained subobjects that are estimators.
+        """
+        params = {"n_components": self.n_components,
+                  "reg": self.reg,
+                  "log": self.log}
+        return params
 
     def fit(self, epochs_data, y):
         """Estimate the CSP decomposition on epochs.
@@ -81,26 +108,51 @@ class CSP(TransformerMixin):
             raise ValueError("epochs_data should be of type ndarray (got %s)."
                              % type(epochs_data))
         epochs_data = np.atleast_3d(epochs_data)
+        e, c, t = epochs_data.shape
         # check number of epochs
-        if epochs_data.shape[0] != len(y):
+        if e != len(y):
             raise ValueError("n_epochs must be the same for epochs_data and y")
         classes = np.unique(y)
         if len(classes) != 2:
             raise ValueError("More than two different classes in the data.")
-        # concatenate epochs
-        class_1 = np.transpose(epochs_data[y == classes[0]],
-                               [1, 0, 2]).reshape(epochs_data.shape[1], -1)
-        class_2 = np.transpose(epochs_data[y == classes[1]],
-                               [1, 0, 2]).reshape(epochs_data.shape[1], -1)
+        if not (self.cov_est == "concat" or self.cov_est == "epoch"):
+            raise ValueError("unknown covariance estimation method")
 
-        cov_1 = _regularized_covariance(class_1, reg=self.reg)
-        cov_2 = _regularized_covariance(class_2, reg=self.reg)
+        if self.cov_est == "concat":  # concatenate epochs
+            class_1 = np.transpose(epochs_data[y == classes[0]],
+                                   [1, 0, 2]).reshape(c, -1)
+            class_2 = np.transpose(epochs_data[y == classes[1]],
+                                   [1, 0, 2]).reshape(c, -1)
+            cov_1 = _regularized_covariance(class_1, reg=self.reg)
+            cov_2 = _regularized_covariance(class_2, reg=self.reg)
+        elif self.cov_est == "epoch":
+            class_1 = epochs_data[y == classes[0]]
+            class_2 = epochs_data[y == classes[1]]
+            cov_1 = np.zeros((c, c))
+            for t in class_1:
+                cov_1 += _regularized_covariance(t, reg=self.reg)
+            cov_1 /= class_1.shape[0]
+            cov_2 = np.zeros((c, c))
+            for t in class_2:
+                cov_2 += _regularized_covariance(t, reg=self.reg)
+            cov_2 /= class_2.shape[0]
 
-        # then fit on covariance
-        self._fit(cov_1, cov_2)
+        # normalize by trace
+        cov_1 /= np.trace(cov_1)
+        cov_2 /= np.trace(cov_2)
+
+        e, w = linalg.eigh(cov_1, cov_1 + cov_2)
+        n_vals = len(e)
+        # Rearrange vectors
+        ind = np.empty(n_vals, dtype=int)
+        ind[::2] = np.arange(n_vals - 1, n_vals // 2 - 1, -1)
+        ind[1::2] = np.arange(0, n_vals // 2)
+        w = w[:, ind]  # first, last, second, second last, third, ...
+        self.filters_ = w.T
+        self.patterns_ = linalg.pinv(w)
 
         pick_filters = self.filters_[:self.n_components]
-        X = np.asarray([np.dot(pick_filters, e) for e in epochs_data])
+        X = np.asarray([np.dot(pick_filters, epoch) for epoch in epochs_data])
 
         # compute features (mean band power)
         X = (X ** 2).mean(axis=-1)
@@ -110,33 +162,6 @@ class CSP(TransformerMixin):
         self.std_ = X.std(axis=0)
 
         return self
-
-    def _fit(self, cov_a, cov_b):
-        """Aux Function (modifies cov_a and cov_b in-place)."""
-        cov_a /= np.trace(cov_a)
-        cov_b /= np.trace(cov_b)
-        # computes the eigen values
-        lambda_, u = linalg.eigh(cov_a + cov_b)
-        # sort them
-        ind = np.argsort(lambda_)[::-1]
-        lambda2_ = lambda_[ind]
-
-        u = u[:, ind]
-        p = np.dot(np.sqrt(linalg.pinv(np.diag(lambda2_))), u.T)
-
-        # Compute the generalized eigen value problem
-        w_a = np.dot(np.dot(p, cov_a), p.T)
-        w_b = np.dot(np.dot(p, cov_b), p.T)
-        # and solve it
-        vals, vecs = linalg.eigh(w_a, w_b)
-        # sort vectors by discriminative power using eigen values
-        ind = np.argsort(np.maximum(vals, 1. / vals))[::-1]
-        vecs = vecs[:, ind]
-        # and project
-        w = np.dot(vecs.T, p)
-
-        self.filters_ = w
-        self.patterns_ = linalg.pinv(w).T
 
     def transform(self, epochs_data, y=None):
         """Estimate epochs sources given the CSP filters.
@@ -161,7 +186,7 @@ class CSP(TransformerMixin):
                                'decomposition.')
 
         pick_filters = self.filters_[:self.n_components]
-        X = np.asarray([np.dot(pick_filters, e) for e in epochs_data])
+        X = np.asarray([np.dot(pick_filters, epoch) for epoch in epochs_data])
 
         # compute features (mean band power)
         X = (X ** 2).mean(axis=-1)
@@ -195,7 +220,8 @@ class CSP(TransformerMixin):
         ch_type : 'mag' | 'grad' | 'planar1' | 'planar2' | 'eeg' | None
             The channel type to plot. For 'grad', the gradiometers are
             collected in pairs and the RMS for each pair is plotted.
-            If None, then channels are chosen in the order given above.
+            If None, then first available channel type from order given
+            above is used. Defaults to None.
         layout : None | Layout
             Layout instance specifying sensor positions (does not need to be
             specified for Neuromag data). If possible, the correct layout file
@@ -210,9 +236,20 @@ class CSP(TransformerMixin):
             If None, the maximum absolute value is used. If vmin is None,
             but vmax is not, defaults to np.min(data).
             If callable, the output equals vmax(data).
-        cmap : matplotlib colormap
-            Colormap. For magnetometers and eeg defaults to 'RdBu_r', else
-            'Reds'.
+        cmap : matplotlib colormap | (colormap, bool) | 'interactive' | None
+            Colormap to use. If tuple, the first value indicates the colormap
+            to use and the second value is a boolean defining interactivity. In
+            interactive mode the colors are adjustable by clicking and dragging
+            the colorbar with left and right mouse button. Left mouse button
+            moves the scale up and down and right mouse button adjusts the
+            range. Hitting space bar resets the range. Up and down arrows can
+            be used to change the colormap. If None, 'Reds' is used for all
+            positive data, otherwise defaults to 'RdBu_r'. If 'interactive',
+            translates to (None, True). Defaults to 'RdBu_r'.
+
+            .. warning::  Interactive mode works smoothly only for a small
+                amount of topomaps.
+
         sensors : bool | str
             Add markers for sensor locations to the plot. Accepts matplotlib
             plot format string (e.g., 'r+' for red plusses). If True,
@@ -251,7 +288,7 @@ class CSP(TransformerMixin):
             Title. If None (default), no title is displayed.
         mask : ndarray of bool, shape (n_channels, n_times) | None
             The channels to be marked as significant at a given time point.
-            Indicies set to `True` will be considered. Defaults to None.
+            Indices set to `True` will be considered. Defaults to None.
         mask_params : dict | None
             Additional plotting parameters for plotting significant sensors.
             Default (None) equals::
@@ -259,16 +296,17 @@ class CSP(TransformerMixin):
                 dict(marker='o', markerfacecolor='w', markeredgecolor='k',
                      linewidth=0, markersize=4)
 
-        outlines : 'head' | dict | None
-            The outlines to be drawn. If 'head', a head scheme will be drawn.
-            If dict, each key refers to a tuple of x and y positions.
-            The values in 'mask_pos' will serve as image mask.
-            If None, nothing will be drawn. Defaults to 'head'.
-            If dict, the 'autoshrink' (bool) field will trigger automated
-            shrinking of the positions due to points outside the outline.
-            Moreover, a matplotlib patch object can be passed for
-            advanced masking options, either directly or as a function that
-            returns patches (required for multi-axis plots).
+        outlines : 'head' | 'skirt' | dict | None
+            The outlines to be drawn. If 'head', the default head scheme will
+            be drawn. If 'skirt' the head scheme will be drawn, but sensors are
+            allowed to be plotted outside of the head circle. If dict, each key
+            refers to a tuple of x and y positions, the values in 'mask_pos'
+            will serve as image mask, and the 'autoshrink' (bool) field will
+            trigger automated shrinking of the positions due to points outside
+            the outline. Alternatively, a matplotlib patch object can be passed
+            for advanced masking options, either directly or as a function that
+            returns patches (required for multi-axis plots). If None, nothing
+            will be drawn. Defaults to 'head'.
         contours : int | False | None
             The number of contour lines to draw.
             If 0, no contours will be drawn.
@@ -338,7 +376,8 @@ class CSP(TransformerMixin):
         ch_type : 'mag' | 'grad' | 'planar1' | 'planar2' | 'eeg' | None
             The channel type to plot. For 'grad', the gradiometers are
             collected in pairs and the RMS for each pair is plotted.
-            If None, then channels are chosen in the order given above.
+            If None, then first available channel type from order given
+            above is used. Defaults to None.
         layout : None | Layout
             Layout instance specifying sensor positions (does not need to be
             specified for Neuromag data). If possible, the correct layout file
@@ -353,9 +392,20 @@ class CSP(TransformerMixin):
             If None, the maximum absolute value is used. If vmin is None,
             but vmax is not, defaults to np.min(data).
             If callable, the output equals vmax(data).
-        cmap : matplotlib colormap
-            Colormap. For magnetometers and eeg defaults to 'RdBu_r', else
-            'Reds'.
+        cmap : matplotlib colormap | (colormap, bool) | 'interactive' | None
+            Colormap to use. If tuple, the first value indicates the colormap
+            to use and the second value is a boolean defining interactivity. In
+            interactive mode the colors are adjustable by clicking and dragging
+            the colorbar with left and right mouse button. Left mouse button
+            moves the scale up and down and right mouse button adjusts the
+            range. Hitting space bar resets the range. Up and down arrows can
+            be used to change the colormap. If None, 'Reds' is used for all
+            positive data, otherwise defaults to 'RdBu_r'. If 'interactive',
+            translates to (None, True). Defaults to 'RdBu_r'.
+
+            .. warning::  Interactive mode works smoothly only for a small
+                amount of topomaps.
+
         sensors : bool | str
             Add markers for sensor locations to the plot. Accepts matplotlib
             plot format string (e.g., 'r+' for red plusses). If True,
@@ -394,7 +444,7 @@ class CSP(TransformerMixin):
             Title. If None (default), no title is displayed.
         mask : ndarray of bool, shape (n_channels, n_times) | None
             The channels to be marked as significant at a given time point.
-            Indicies set to `True` will be considered. Defaults to None.
+            Indices set to `True` will be considered. Defaults to None.
         mask_params : dict | None
             Additional plotting parameters for plotting significant sensors.
             Default (None) equals::
@@ -402,16 +452,17 @@ class CSP(TransformerMixin):
                 dict(marker='o', markerfacecolor='w', markeredgecolor='k',
                      linewidth=0, markersize=4)
 
-        outlines : 'head' | dict | None
-            The outlines to be drawn. If 'head', a head scheme will be drawn.
-            If dict, each key refers to a tuple of x and y positions.
-            The values in 'mask_pos' will serve as image mask.
-            If None, nothing will be drawn. Defaults to 'head'.
-            If dict, the 'autoshrink' (bool) field will trigger automated
-            shrinking of the positions due to points outside the outline.
-            Moreover, a matplotlib patch object can be passed for
-            advanced masking options, either directly or as a function that
-            returns patches (required for multi-axis plots).
+        outlines : 'head' | 'skirt' | dict | None
+            The outlines to be drawn. If 'head', the default head scheme will
+            be drawn. If 'skirt' the head scheme will be drawn, but sensors are
+            allowed to be plotted outside of the head circle. If dict, each key
+            refers to a tuple of x and y positions, the values in 'mask_pos'
+            will serve as image mask, and the 'autoshrink' (bool) field will
+            trigger automated shrinking of the positions due to points outside
+            the outline. Alternatively, a matplotlib patch object can be passed
+            for advanced masking options, either directly or as a function that
+            returns patches (required for multi-axis plots). If None, nothing
+            will be drawn. Defaults to 'head'.
         contours : int | False | None
             The number of contour lines to draw.
             If 0, no contours will be drawn.

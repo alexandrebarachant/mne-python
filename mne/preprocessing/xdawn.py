@@ -4,6 +4,7 @@
 # License: BSD (3-clause)
 
 import copy as cp
+
 import numpy as np
 from scipy import linalg
 
@@ -91,10 +92,10 @@ def _check_overlapp(epochs):
 
 def _construct_signal_from_epochs(epochs):
     """Reconstruct pseudo continuous signal from epochs."""
-    start = (np.min(epochs.events[:, 0])
-             + int(epochs.tmin * epochs.info['sfreq']))
-    stop = (np.max(epochs.events[:, 0])
-            + int(epochs.tmax * epochs.info['sfreq']) + 1)
+    start = (np.min(epochs.events[:, 0]) +
+             int(epochs.tmin * epochs.info['sfreq']))
+    stop = (np.max(epochs.events[:, 0]) +
+            int(epochs.tmax * epochs.info['sfreq']) + 1)
 
     n_samples = stop - start
     epochs_data = epochs.get_data()
@@ -157,7 +158,7 @@ class Xdawn(TransformerMixin, ContainsMixin):
     """Implementation of the Xdawn Algorithm.
 
     Xdawn is a spatial filtering method designed to improve the signal
-    to signal + noise ratio (SSNR) of the ERP responses. Xdawn was originaly
+    to signal + noise ratio (SSNR) of the ERP responses. Xdawn was originally
     designed for P300 evoked potential by enhancing the target response with
     respect to the non-target response. This implementation is a generalization
     to any type of ERP.
@@ -176,18 +177,18 @@ class Xdawn(TransformerMixin, ContainsMixin):
     reg : float | str | None (default None)
         if not None, allow regularization for covariance estimation
         if float, shrinkage covariance is used (0 <= shrinkage <= 1).
-        if str, optimal shrinkage using Ledoit-Wolf Shrinkage ('lws') or
-        Oracle Approximating Shrinkage ('oas').
+        if str, optimal shrinkage using Ledoit-Wolf Shrinkage ('ledoit_wolf')
+        or Oracle Approximating Shrinkage ('oas').
 
     Attributes
     ----------
-    filters_ : dict of ndarray
+    ``filters_`` : dict of ndarray
         If fit, the Xdawn components used to decompose the data for each event
         type, else empty.
-    patterns_ : dict of ndarray
+    ``patterns_`` : dict of ndarray
         If fit, the Xdawn patterns used to restore M/EEG signals for each event
         type, else empty.
-    evokeds_ : dict of evoked instance
+    ``evokeds_`` : dict of evoked instance
         If fit, the evoked response for each event type.
 
     Notes
@@ -240,6 +241,11 @@ class Xdawn(TransformerMixin, ContainsMixin):
         self : Xdawn instance
             The Xdawn instance.
         """
+
+        # Ensure epochs order
+        if np.any(np.diff(epochs.events[:, 0].astype(int)) < 0):
+            epochs = epochs[np.argsort(epochs.events[:, 0])]
+
         if self.correct_overlap == 'auto':
             self.correct_overlap = _check_overlapp(epochs)
 
@@ -347,11 +353,11 @@ class Xdawn(TransformerMixin, ContainsMixin):
             The kind of event to apply. if None, a dict of inst will be return
             one for each type of event xdawn has been fitted.
         include : array_like of int | None (default None)
-            The indices refering to columns in the ummixing matrix. The
+            The indices referring to columns in the ummixing matrix. The
             components to be kept. If None, the first n_components (as defined
             in the Xdawn constructor) will be kept.
         exclude : array_like of int | None (default None)
-            The indices refering to columns in the ummixing matrix. The
+            The indices referring to columns in the ummixing matrix. The
             components to be zeroed out. If None, all the components except the
             first n_components will be exclude.
 

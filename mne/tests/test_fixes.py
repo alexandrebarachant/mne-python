@@ -14,9 +14,12 @@ from mne.utils import run_tests_if_main
 from mne.fixes import (_in1d, _tril_indices, _copysign, _unravel_index,
                        _Counter, _unique, _bincount, _digitize,
                        _sparse_block_diag, _matrix_rank, _meshgrid,
-                       _isclose)
-from mne.fixes import _firwin2 as mne_firwin2
-from mne.fixes import _filtfilt as mne_filtfilt
+                       _isclose,
+                       _firwin2 as mne_firwin2,
+                       _filtfilt as mne_filtfilt,
+                       _sosfiltfilt as mne_sosfiltfilt)
+
+rng = np.random.RandomState(0)
 
 
 def test_counter():
@@ -42,7 +45,7 @@ def test_unique():
     # skip test for np version < 1.5
     if LooseVersion(np.__version__) < LooseVersion('1.5'):
         return
-    for arr in [np.array([]), np.random.rand(10), np.ones(10)]:
+    for arr in [np.array([]), rng.rand(10), np.ones(10)]:
         # basic
         assert_array_equal(np.unique(arr), _unique(arr))
         # with return_index=True
@@ -146,6 +149,8 @@ def test_filtfilt():
     # Filter with an impulse
     y = mne_filtfilt([1, 0], [1, 0], x, padlen=0)
     assert_array_equal(x, y)
+    y = mne_sosfiltfilt(np.array([[1., 0., 0., 1, 0., 0.]]), x, padlen=0)
+    assert_array_equal(x, y)
 
 
 def test_sparse_block_diag():
@@ -182,7 +187,7 @@ def test_meshgrid():
 def test_isclose():
     """Test isclose replacement
     """
-    a = np.random.RandomState(0).randn(10)
+    a = rng.randn(10)
     b = a.copy()
     assert_true(_isclose(a, b).all())
     a[0] = np.inf

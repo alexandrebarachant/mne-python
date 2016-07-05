@@ -2,18 +2,18 @@
 #
 # License: BSD (3-clause)
 
-import re
 import copy
-import time
+import re
 import threading
-import warnings
+import time
+
 import numpy as np
 
-from ..io.constants import FIFF
-from ..io.meas_info import _empty_info
+from ..io import _empty_info
 from ..io.pick import pick_info
+from ..io.constants import FIFF
 from ..epochs import EpochsArray
-from ..utils import logger
+from ..utils import logger, warn
 from ..externals.FieldTrip import Client as FtClient
 
 
@@ -133,19 +133,13 @@ class FieldTripClient(object):
         Creates a minimal Info dictionary required for epoching, averaging
         et al.
         """
-
         if self.info is None:
+            warn('Info dictionary not provided. Trying to guess it from '
+                 'FieldTrip Header object')
 
-            warnings.warn('Info dictionary not provided. Trying to guess it '
-                          'from FieldTrip Header object')
-
-            info = _empty_info()  # create info dictionary
+            info = _empty_info(self.ft_header.fSample)  # create info
 
             # modify info attributes according to the FieldTrip Header object
-            info['nchan'] = self.ft_header.nChannels
-            info['sfreq'] = self.ft_header.fSample
-            info['ch_names'] = self.ft_header.labels
-
             info['comps'] = list()
             info['projs'] = list()
             info['bads'] = list()
@@ -153,7 +147,7 @@ class FieldTripClient(object):
             # channel dictionary list
             info['chs'] = []
 
-            for idx, ch in enumerate(info['ch_names']):
+            for idx, ch in enumerate(self.ft_header.labels):
                 this_info = dict()
 
                 this_info['scanno'] = idx
@@ -183,9 +177,7 @@ class FieldTripClient(object):
                 this_info['cal'] = 1.0
 
                 this_info['ch_name'] = ch
-                this_info['coil_trans'] = None
                 this_info['loc'] = None
-                this_info['eeg_loc'] = None
 
                 if ch.startswith('EEG'):
                     this_info['coord_frame'] = FIFF.FIFFV_COORD_HEAD
@@ -205,6 +197,8 @@ class FieldTripClient(object):
                 this_info['unit_mul'] = 0
 
                 info['chs'].append(this_info)
+                info._update_redundant()
+                info._check_consistency()
 
         else:
 
@@ -247,6 +241,10 @@ class FieldTripClient(object):
         -------
         epoch : instance of Epochs
             The samples fetched as an Epochs object.
+
+        See Also
+        --------
+        Epochs.iter_evoked
         """
         ft_header = self.ft_client.getHeader()
         last_samp = ft_header.nSamples - 1
@@ -260,7 +258,7 @@ class FieldTripClient(object):
         # create epoch from data
         info = self.info
         if picks is not None:
-            info = pick_info(info, picks, copy=True)
+            info = pick_info(info, picks)
         epoch = EpochsArray(data[picks][np.newaxis], info, events)
 
         return epoch

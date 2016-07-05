@@ -9,7 +9,6 @@ from functools import reduce
 from string import ascii_uppercase
 
 from ..externals.six import string_types
-from ..utils import deprecated
 from ..fixes import matrix_rank
 
 # The following function is a rewriting of scipy.stats.f_oneway
@@ -186,15 +185,6 @@ def _iter_contrasts(n_subjects, factor_levels, effect_picks):
         yield c_, df1, df2
 
 
-@deprecated('"f_threshold_twoway_rm" is deprecated and will be removed in'
-            'MNE-0.11. Please use f_threshold_mway_rm instead')
-def f_threshold_twoway_rm(n_subjects, factor_levels, effects='A*B',
-                          pvalue=0.05):
-    return f_threshold_mway_rm(
-        n_subjects=n_subjects, factor_levels=factor_levels,
-        effects=effects, pvalue=pvalue)
-
-
 def f_threshold_mway_rm(n_subjects, factor_levels, effects='A*B',
                         pvalue=0.05):
     """ Compute f-value thesholds for a two-way ANOVA
@@ -208,11 +198,13 @@ def f_threshold_mway_rm(n_subjects, factor_levels, effects='A*B',
     effects : str
         A string denoting the effect to be returned. The following
         mapping is currently supported:
-            'A': main effect of A
-            'B': main effect of B
-            'A:B': interaction effect
-            'A+B': both main effects
-            'A*B': all three effects
+
+            * ``'A'``: main effect of A
+            * ``'B'``: main effect of B
+            * ``'A:B'``: interaction effect
+            * ``'A+B'``: both main effects
+            * ``'A*B'``: all three effects
+
     pvalue : float
         The p-value to be thresholded.
 
@@ -242,18 +234,6 @@ def f_threshold_mway_rm(n_subjects, factor_levels, effects='A*B',
     return f_threshold if len(f_threshold) > 1 else f_threshold[0]
 
 
-# The following functions based on MATLAB code by Rik Henson
-# and Python code from the pvttble toolbox by Roger Lew.
-@deprecated('"f_twoway_rm" is deprecated and will be removed in MNE 0.11."'
-            " Please use f_mway_rm instead")
-def f_twoway_rm(data, factor_levels, effects='A*B', alpha=0.05,
-                correction=False, return_pvals=True):
-    """This function is deprecated, use `f_mway_rm` instead"""
-    return f_mway_rm(data=data, factor_levels=factor_levels, effects=effects,
-                     alpha=alpha, correction=correction,
-                     return_pvals=return_pvals)
-
-
 def f_mway_rm(data, factor_levels, effects='all', alpha=0.05,
               correction=False, return_pvals=True):
     """M-way repeated measures ANOVA for fully balanced designs
@@ -262,14 +242,13 @@ def f_mway_rm(data, factor_levels, effects='all', alpha=0.05,
     ----------
     data : ndarray
         3D array where the first two dimensions are compliant
-        with a subjects X conditions scheme:
+        with a subjects X conditions scheme where the first
+        factor repeats slowest::
 
-        first factor repeats slowest:
-
-                    A1B1 A1B2 A2B1 B2B2
-        subject 1   1.34 2.53 0.97 1.74
-        subject ... .... .... .... ....
-        subject k   2.45 7.90 3.09 4.76
+                        A1B1 A1B2 A2B1 A2B2
+            subject 1   1.34 2.53 0.97 1.74
+            subject ... .... .... .... ....
+            subject k   2.45 7.90 3.09 4.76
 
         The last dimensions is thought to carry the observations
         for mass univariate analysis.
@@ -278,14 +257,15 @@ def f_mway_rm(data, factor_levels, effects='all', alpha=0.05,
     effects : str | list
         A string denoting the effect to be returned. The following
         mapping is currently supported (example with 2 factors):
-            'A': main effect of A
-            'B': main effect of B
-            'A:B': interaction effect
-            'A+B': both main effects
-            'A*B': all three effects
-            'all': all effects (equals 'A*B' in a 2 way design)
-        if list, effect names are used:
-            ['A', 'B', 'A:B']
+
+            * ``'A'``: main effect of A
+            * ``'B'``: main effect of B
+            * ``'A:B'``: interaction effect
+            * ``'A+B'``: both main effects
+            * ``'A*B'``: all three effects
+            * ``'all'``: all effects (equals 'A*B' in a 2 way design)
+
+        If list, effect names are used: ``['A', 'B', 'A:B']``.
     alpha : float
         The significance threshold.
     correction : bool
@@ -324,7 +304,7 @@ def f_mway_rm(data, factor_levels, effects='all', alpha=0.05,
     n_obs = data.shape[2]
     n_replications = data.shape[0]
 
-    # pute last axis in fornt to 'iterate' over mass univariate instances.
+    # put last axis in front to 'iterate' over mass univariate instances.
     data = np.rollaxis(data, 2)
     fvalues, pvalues = [], []
     for c_, df1, df2 in _iter_contrasts(n_replications, factor_levels,
@@ -345,7 +325,10 @@ def f_mway_rm(data, factor_levels, effects='all', alpha=0.05,
 
         df1, df2 = np.zeros(n_obs) + df1, np.zeros(n_obs) + df2
         if correction:
-            df1, df2 = [d[None, :] * eps for d in (df1, df2)]
+            # numerical imprecision can cause eps=0.99999999999999989
+            # even with a single category, so never let our degrees of
+            # freedom drop below 1.
+            df1, df2 = [np.maximum(d[None, :] * eps, 1.) for d in (df1, df2)]
 
         if return_pvals:
             pvals = f(df1, df2).sf(fvals)

@@ -7,21 +7,21 @@ import os.path as op
 from nose.tools import (assert_equal, assert_raises)
 from numpy.testing import assert_array_equal
 from mne import (io, Epochs, read_events, pick_types,
-                 compute_raw_data_covariance)
+                 compute_raw_covariance)
 from mne.utils import requires_sklearn, run_tests_if_main
 from mne.preprocessing.xdawn import Xdawn
 
 base_dir = op.join(op.dirname(__file__), '..', '..', 'io', 'tests', 'data')
 raw_fname = op.join(base_dir, 'test_raw.fif')
 event_name = op.join(base_dir, 'test-eve.fif')
-evoked_nf_name = op.join(base_dir, 'test-nf-ave.fif')
 
 tmin, tmax = -0.1, 0.2
 event_id = dict(cond2=2, cond3=3)
 
 
 def _get_data():
-    raw = io.Raw(raw_fname, add_eeg_ref=False, verbose=False, preload=True)
+    raw = io.read_raw_fif(raw_fname, add_eeg_ref=False, verbose=False,
+                          preload=True)
     events = read_events(event_name)
     picks = pick_types(raw.info, meg=False, eeg=True, stim=False,
                        ecg=False, eog=False,
@@ -56,7 +56,7 @@ def test_xdawn_fit():
 
     # ========== with signal cov provided ====================
     # provide covariance object
-    signal_cov = compute_raw_data_covariance(raw, picks=picks)
+    signal_cov = compute_raw_covariance(raw, picks=picks)
     xd = Xdawn(n_components=2, correct_overlap=False,
                signal_cov=signal_cov, reg=None)
     xd.fit(epochs)
@@ -98,7 +98,7 @@ def test_xdawn_apply_transform():
     # apply on raw
     xd.apply(raw)
     # apply on epochs
-    xd.apply(epochs)
+    denoise = xd.apply(epochs)
     # apply on evoked
     xd.apply(epochs.average())
     # apply on other thing should raise an error
@@ -110,6 +110,13 @@ def test_xdawn_apply_transform():
     xd.transform(epochs._data)
     # transform on someting else
     assert_raises(ValueError, xd.transform, 42)
+
+    # check numerical results with shuffled epochs
+    idx = np.arange(len(epochs))
+    np.random.shuffle(idx)
+    xd.fit(epochs[idx])
+    denoise_shfl = xd.apply(epochs)
+    assert_array_equal(denoise['cond2']._data, denoise_shfl['cond2']._data)
 
 
 @requires_sklearn
@@ -127,7 +134,7 @@ def test_xdawn_regularization():
     # ========== with cov regularization ====================
     # ledoit-wolf
     xd = Xdawn(n_components=2, correct_overlap=False,
-               signal_cov=np.eye(len(picks)), reg='lws')
+               signal_cov=np.eye(len(picks)), reg='ledoit_wolf')
     xd.fit(epochs)
     # oas
     xd = Xdawn(n_components=2, correct_overlap=False,

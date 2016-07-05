@@ -20,8 +20,7 @@ evoked responses.
 import matplotlib.pyplot as plt
 import mne
 
-from mne.io import Raw
-from mne.viz import plot_topo
+from mne.viz import plot_evoked_topo
 from mne.datasets import sample
 
 print(__doc__)
@@ -37,7 +36,7 @@ tmin = -0.2
 tmax = 0.5
 
 #   Setup for reading the raw data
-raw = Raw(raw_fname)
+raw = mne.io.read_raw_fif(raw_fname)
 events = mne.read_events(event_fname)
 
 #   Set up pick list: MEG + STI 014 - bad channels (modify to your needs)
@@ -66,7 +65,7 @@ evokeds = [epochs[name].average() for name in ('left', 'right')]
 colors = 'yellow', 'green'
 title = 'MNE sample data - left vs right (A/V combined)'
 
-plot_topo(evokeds, color=colors, title=title)
+plot_evoked_topo(evokeds, color=colors, title=title)
 
 conditions = [e.comment for e in evokeds]
 for cond, col, pos in zip(conditions, colors, (0.025, 0.07)):

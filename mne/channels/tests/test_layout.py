@@ -9,6 +9,8 @@ from __future__ import print_function
 import copy
 import os.path as op
 import warnings
+# Set our plotters to test mode
+import matplotlib
 
 import numpy as np
 from numpy.testing import (assert_array_almost_equal, assert_array_equal,
@@ -20,11 +22,11 @@ from mne.channels.layout import (_box_size, _auto_topomap_coords,
                                  generate_2d_layout)
 from mne.utils import run_tests_if_main
 from mne import pick_types, pick_info
-from mne.io import Raw, read_raw_kit
-from mne.io.meas_info import Info
+from mne.io import Raw, read_raw_kit, _empty_info
 from mne.io.constants import FIFF
-from mne.preprocessing.maxfilter import fit_sphere_to_headshape
+from mne.bem import fit_sphere_to_headshape
 from mne.utils import _TempDir
+matplotlib.use('Agg')  # for testing don't use X server
 
 warnings.simplefilter('always')
 
@@ -40,54 +42,28 @@ bti_dir = op.join(op.dirname(__file__), '..', '..', 'io', 'bti',
 fname_ctf_raw = op.join(op.dirname(__file__), '..', '..', 'io', 'tests',
                         'data', 'test_ctf_comp_raw.fif')
 
-fname_kit_157 = op.join(op.dirname(__file__), '..', '..',  'io', 'kit',
+fname_kit_157 = op.join(op.dirname(__file__), '..', '..', 'io', 'kit',
                         'tests', 'data', 'test.sqd')
 
-test_info = Info({
-    'ch_names': ['ICA 001', 'ICA 002', 'EOG 061'],
-    'chs': [{'cal': 1,
-             'ch_name': 'ICA 001',
-             'coil_trans': None,
-             'coil_type': 0,
-             'coord_Frame': 0,
-             'eeg_loc': None,
-             'kind': 502,
-             'loc': np.array([0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1.],
-                             dtype=np.float32),
-             'logno': 1,
-             'range': 1.0,
-             'scanno': 1,
-             'unit': -1,
-             'unit_mul': 0},
-            {'cal': 1,
-             'ch_name': 'ICA 002',
-             'coil_trans': None,
-             'coil_type': 0,
-             'coord_Frame': 0,
-             'eeg_loc': None,
-             'kind': 502,
-             'loc': np.array([0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1.],
-                             dtype=np.float32),
-             'logno': 2,
-             'range': 1.0,
-             'scanno': 2,
-             'unit': -1,
-             'unit_mul': 0},
-            {'cal': 0.002142000012099743,
-             'ch_name': 'EOG 061',
-             'coil_trans': None,
-             'coil_type': 1,
-             'coord_frame': 0,
-             'eeg_loc': None,
-             'kind': 202,
-             'loc': np.array([0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1.],
-                             dtype=np.float32),
-             'logno': 61,
-             'range': 1.0,
-             'scanno': 376,
-             'unit': 107,
-             'unit_mul': 0}],
-    'nchan': 3})
+
+def _get_test_info():
+    """Helper to make test info"""
+    test_info = _empty_info(1000)
+    loc = np.array([0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1.],
+                   dtype=np.float32)
+    test_info['chs'] = [
+        {'cal': 1, 'ch_name': 'ICA 001', 'coil_type': 0, 'coord_Frame': 0,
+         'kind': 502, 'loc': loc.copy(), 'logno': 1, 'range': 1.0, 'scanno': 1,
+         'unit': -1, 'unit_mul': 0},
+        {'cal': 1, 'ch_name': 'ICA 002', 'coil_type': 0, 'coord_Frame': 0,
+         'kind': 502, 'loc': loc.copy(), 'logno': 2, 'range': 1.0, 'scanno': 2,
+         'unit': -1, 'unit_mul': 0},
+        {'cal': 0.002142000012099743, 'ch_name': 'EOG 061', 'coil_type': 1,
+         'coord_frame': 0, 'kind': 202, 'loc': loc.copy(), 'logno': 61,
+         'range': 1.0, 'scanno': 376, 'unit': 107, 'unit_mul': 0}]
+    test_info._update_redundant()
+    test_info._check_consistency()
+    return test_info
 
 
 def test_io_layout_lout():
@@ -128,8 +104,7 @@ def test_auto_topomap_coords():
     dig_kinds = (FIFF.FIFFV_POINT_CARDINAL,
                  FIFF.FIFFV_POINT_EEG,
                  FIFF.FIFFV_POINT_EXTRA)
-    _, origin_head, _ = fit_sphere_to_headshape(info, dig_kinds)
-    origin_head /= 1000.  # to meters
+    _, origin_head, _ = fit_sphere_to_headshape(info, dig_kinds, units='m')
     for ch in info['chs']:
         ch['loc'][:3] -= origin_head
 
@@ -139,10 +114,10 @@ def test_auto_topomap_coords():
     # Remove electrode position information, use digitization points from now
     # on.
     for ch in info['chs']:
-        ch['loc'] = np.zeros(12)
+        ch['loc'].fill(0)
 
     l1 = _auto_topomap_coords(info, picks)
-    assert_allclose(l1, l0)
+    assert_allclose(l1, l0, atol=1e-3)
 
     # Test plotting mag topomap without channel locations: it should fail
     mag_picks = pick_types(info, meg='mag')
@@ -203,7 +178,7 @@ def test_make_grid_layout():
     tmp_name = 'bar'
     lout_name = 'test_ica'
     lout_orig = read_layout(kind=lout_name, path=lout_path)
-    layout = make_grid_layout(test_info)
+    layout = make_grid_layout(_get_test_info())
     layout.save(op.join(tempdir, tmp_name + '.lout'))
     lout_new = read_layout(kind=tmp_name, path=tempdir)
     assert_array_equal(lout_new.kind, tmp_name)
@@ -211,7 +186,7 @@ def test_make_grid_layout():
     assert_array_equal(lout_orig.names, lout_new.names)
 
     # Test creating grid layout with specified number of columns
-    layout = make_grid_layout(test_info, n_col=2)
+    layout = make_grid_layout(_get_test_info(), n_col=2)
     # Vertical positions should be equal
     assert_true(layout.pos[0, 1] == layout.pos[1, 1])
     # Horizontal positions should be unequal
@@ -222,7 +197,8 @@ def test_make_grid_layout():
 
 def test_find_layout():
     """Test finding layout"""
-    assert_raises(ValueError, find_layout, test_info, ch_type='meep')
+    import matplotlib.pyplot as plt
+    assert_raises(ValueError, find_layout, _get_test_info(), ch_type='meep')
 
     sample_info = Raw(fif_fname).info
     grads = pick_types(sample_info, meg='grad')
@@ -235,7 +211,6 @@ def test_find_layout():
     sample_info4 = copy.deepcopy(sample_info)
     for ii, name in enumerate(sample_info4['ch_names']):
         new = name.replace(' ', '')
-        sample_info4['ch_names'][ii] = new
         sample_info4['chs'][ii]['ch_name'] = new
 
     eegs = pick_types(sample_info, meg=False, eeg=True)
@@ -279,15 +254,24 @@ def test_find_layout():
     assert_true(lout.kind == 'EEG')
     # no common layout, 'meg' option not supported
 
+    lout = find_layout(Raw(fname_ctf_raw).info)
+    assert_true(lout.kind == 'CTF-275')
+
     fname_bti_raw = op.join(bti_dir, 'exported4D_linux_raw.fif')
     lout = find_layout(Raw(fname_bti_raw).info)
     assert_true(lout.kind == 'magnesWH3600')
 
-    lout = find_layout(Raw(fname_ctf_raw).info)
-    assert_true(lout.kind == 'CTF-275')
-
-    lout = find_layout(read_raw_kit(fname_kit_157).info)
+    raw_kit = read_raw_kit(fname_kit_157)
+    lout = find_layout(raw_kit.info)
     assert_true(lout.kind == 'KIT-157')
+
+    raw_kit.info['bads'] = ['MEG  13', 'MEG  14', 'MEG  15', 'MEG  16']
+    lout = find_layout(raw_kit.info)
+    assert_true(lout.kind == 'KIT-157')
+
+    # Test plotting
+    lout.plot()
+    plt.close('all')
 
 
 def test_box_size():
@@ -358,7 +342,7 @@ def test_generate_2d_layout():
     snobg = 10
     sbg = 15
     side = range(snobg)
-    bg_image = np.random.randn(sbg, sbg)
+    bg_image = np.random.RandomState(42).randn(sbg, sbg)
     w, h = [.2, .5]
 
     # Generate fake data

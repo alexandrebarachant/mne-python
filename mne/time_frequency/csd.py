@@ -2,14 +2,13 @@
 #
 # License: BSD (3-clause)
 
-import warnings
 import copy as cp
 
 import numpy as np
 from scipy.fftpack import fftfreq
 
 from ..io.pick import pick_types
-from ..utils import logger, verbose
+from ..utils import logger, verbose, warn
 from ..time_frequency.multitaper import (dpss_windows, _mt_spectra,
                                          _csd_from_mt, _psd_from_mt_adaptive)
 
@@ -119,9 +118,9 @@ def compute_epochs_csd(epochs, mode='multitaper', fmin=0, fmax=np.inf,
     if tmax is not None and tmin is not None:
         if tmax < tmin:
             raise ValueError('tmax must be larger than tmin')
-    if epochs.baseline is None:
-        warnings.warn('Epochs are not baseline corrected, cross-spectral '
-                      'density may be inaccurate')
+    if epochs.baseline is None and epochs.info['highpass'] < 0.1:
+        warn('Epochs are not baseline corrected or enough highpass filtered. '
+             'Cross-spectral density may be inaccurate.')
 
     if projs is None:
         projs = cp.deepcopy(epochs.info['projs'])
@@ -144,9 +143,9 @@ def compute_epochs_csd(epochs, mode='multitaper', fmin=0, fmax=np.inf,
 
     # Preparing frequencies of interest
     sfreq = epochs.info['sfreq']
-    frequencies = fftfreq(n_fft, 1. / sfreq)
-    freq_mask = (frequencies > fmin) & (frequencies < fmax)
-    frequencies = frequencies[freq_mask]
+    orig_frequencies = fftfreq(n_fft, 1. / sfreq)
+    freq_mask = (orig_frequencies > fmin) & (orig_frequencies < fmax)
+    frequencies = orig_frequencies[freq_mask]
     n_freqs = len(frequencies)
 
     if n_freqs == 0:
@@ -172,8 +171,8 @@ def compute_epochs_csd(epochs, mode='multitaper', fmin=0, fmax=np.inf,
                     'windows' % n_tapers)
 
         if mt_adaptive and len(eigvals) < 3:
-            warnings.warn('Not adaptively combining the spectral estimators '
-                          'due to a low number of tapers.')
+            warn('Not adaptively combining the spectral estimators due to a '
+                 'low number of tapers.')
             mt_adaptive = False
     elif mode == 'fourier':
         logger.info('    using FFT with a Hanning window to estimate spectra')
@@ -186,6 +185,9 @@ def compute_epochs_csd(epochs, mode='multitaper', fmin=0, fmax=np.inf,
 
     csds_mean = np.zeros((len(ch_names), len(ch_names), n_freqs),
                          dtype=complex)
+
+    # Picking frequencies of interest
+    freq_mask_mt = freq_mask[orig_frequencies >= 0]
 
     # Compute CSD for each epoch
     n_epochs = 0
@@ -211,8 +213,7 @@ def compute_epochs_csd(epochs, mode='multitaper', fmin=0, fmax=np.inf,
                 # Hack so we can sum over axis=-2
                 weights = np.array([1.])[:, None, None, None]
 
-        # Picking frequencies of interest
-        x_mt = x_mt[:, :, freq_mask]
+        x_mt = x_mt[:, :, freq_mask_mt]
 
         # Calculating CSD
         # Tiling x_mt so that we can easily use _csd_from_mt()

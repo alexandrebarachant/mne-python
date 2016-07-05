@@ -6,37 +6,35 @@ from __future__ import print_function
 #
 # License: BSD (3-clause)
 
-import warnings
-import logging
-import time
+import atexit
 from distutils.version import LooseVersion
+from functools import wraps
+import hashlib
+import inspect
+import json
+import logging
+from math import log, ceil
 import os
 import os.path as op
-from functools import wraps
-import inspect
+import platform
+import shutil
+from shutil import rmtree
 from string import Formatter
 import subprocess
 import sys
 import tempfile
-import shutil
-from shutil import rmtree
-from math import log, ceil
-import json
+import time
+import warnings
 import ftplib
-import hashlib
-from functools import partial
-import atexit
 
 import numpy as np
-import scipy
 from scipy import linalg, sparse
-
 
 from .externals.six.moves import urllib
 from .externals.six import string_types, StringIO, BytesIO
 from .externals.decorator import decorator
 
-from .fixes import isclose
+from .fixes import _get_args, partial
 
 logger = logging.getLogger('mne')  # one selection here used across mne-python
 logger.propagate = False  # don't propagate (in case of multiple imports)
@@ -61,8 +59,41 @@ def nottest(f):
     return f
 
 
+# This list must also be updated in doc/_templates/class.rst if it is
+# changed here!
+_doc_special_members = ('__contains__', '__getitem__', '__iter__', '__len__',
+                        '__call__')
+
 ###############################################################################
 # RANDOM UTILITIES
+
+
+def _check_copy_dep(inst, copy, kind='inst'):
+    """Check for copy deprecation for 0.14"""
+    # For methods with copy=False default, we only need one release cycle
+    # for deprecation (0.13). For copy=True, we first need to go to copy=False
+    # (one cycle; 0.13) then remove copy altogether (one cycle; 0.14).
+    if copy:
+        warn('The copy parameter is deprecated and will be removed in 0.14. '
+             'In 0.13 the default is copy=False. Use %s.copy() if necessary.'
+             % (kind,), DeprecationWarning)
+    elif copy is None:
+        copy = False
+    return inst.copy() if copy else inst
+
+
+def _get_call_line(in_verbose=False):
+    """Helper to get the call line from within a function"""
+    # XXX Eventually we could auto-triage whether in a `verbose` decorated
+    # function or not.
+    # NB This probably only works for functions that are undecorated,
+    # or decorated by `verbose`.
+    back = 2 if not in_verbose else 4
+    call_frame = inspect.getouterframes(inspect.currentframe())[back][0]
+    context = inspect.getframeinfo(call_frame).code_context
+    context = 'unknown' if context is None else context[0].strip()
+    return context
+
 
 def _sort_keys(x):
     """Sort and return keys of dict"""
@@ -90,15 +121,12 @@ def object_hash(x, h=None):
     """
     if h is None:
         h = hashlib.md5()
-    if isinstance(x, dict):
+    if hasattr(x, 'keys'):
+        # dict-like types
         keys = _sort_keys(x)
         for key in keys:
             object_hash(key, h)
             object_hash(x[key], h)
-    elif isinstance(x, (list, tuple)):
-        h.update(str(type(x)).encode('utf-8'))
-        for xx in x:
-            object_hash(xx, h)
     elif isinstance(x, bytes):
         # must come before "str" below
         h.update(x)
@@ -110,6 +138,11 @@ def object_hash(x, h=None):
         h.update(str(x.shape).encode('utf-8'))
         h.update(str(x.dtype).encode('utf-8'))
         h.update(x.tostring())
+    elif hasattr(x, '__len__'):
+        # all other list-like types
+        h.update(str(type(x)).encode('utf-8'))
+        for xx in x:
+            object_hash(xx, h)
     else:
         raise RuntimeError('unsupported type: %s (%s)' % (type(x), x))
     return int(h.hexdigest(), 16)
@@ -141,24 +174,24 @@ def object_diff(a, b, pre=''):
         k2s = _sort_keys(b)
         m1 = set(k2s) - set(k1s)
         if len(m1):
-            out += pre + ' x1 missing keys %s\n' % (m1)
+            out += pre + ' left missing keys %s\n' % (m1)
         for key in k1s:
             if key not in k2s:
-                out += pre + ' x2 missing key %s\n' % key
+                out += pre + ' right missing key %s\n' % key
             else:
-                out += object_diff(a[key], b[key], pre + 'd1[%s]' % repr(key))
+                out += object_diff(a[key], b[key], pre + '[%s]' % repr(key))
     elif isinstance(a, (list, tuple)):
         if len(a) != len(b):
             out += pre + ' length mismatch (%s, %s)\n' % (len(a), len(b))
         else:
-            for xx1, xx2 in zip(a, b):
-                out += object_diff(xx1, xx2, pre='')
+            for ii, (xx1, xx2) in enumerate(zip(a, b)):
+                out += object_diff(xx1, xx2, pre + '[%s]' % ii)
     elif isinstance(a, (string_types, int, float, bytes)):
         if a != b:
             out += pre + ' value mismatch (%s, %s)\n' % (a, b)
     elif a is None:
         if b is not None:
-            out += pre + ' a is None, b is not (%s)\n' % (b)
+            out += pre + ' left is None, right is not (%s)\n' % (b)
     elif isinstance(a, np.ndarray):
         if not np.array_equal(a, b):
             out += pre + ' array mismatch\n'
@@ -238,7 +271,46 @@ def sum_squared(X):
     return np.dot(X_flat, X_flat)
 
 
-def check_fname(fname, filetype, endings):
+def warn(message, category=RuntimeWarning):
+    """Emit a warning with trace outside the mne namespace
+
+    This function takes arguments like warnings.warn, and sends messages
+    using both ``warnings.warn`` and ``logger.warn``. Warnings can be
+    generated deep within nested function calls. In order to provide a
+    more helpful warning, this function traverses the stack until it
+    reaches a frame outside the ``mne`` namespace that caused the error.
+
+    Parameters
+    ----------
+    message : str
+        Warning message.
+    category : instance of Warning
+        The warning class. Defaults to ``RuntimeWarning``.
+    """
+    import mne
+    root_dir = op.dirname(mne.__file__)
+    stacklevel = 1
+    frame = None
+    stack = inspect.stack()
+    last_fname = ''
+    for fi, frame in enumerate(stack):
+        fname = frame[1]
+        del frame
+        if fname == '<string>' and last_fname == 'utils.py':  # in verbose dec
+            last_fname = fname
+            continue
+        # treat tests as scripts
+        if not fname.startswith(root_dir) or \
+                op.basename(op.dirname(fname)) == 'tests':
+            stacklevel = fi + 1
+            break
+        last_fname = op.basename(fname)
+    del stack
+    warnings.warn(message, category, stacklevel=stacklevel)
+    logger.warning(message)
+
+
+def check_fname(fname, filetype, endings, endings_err=()):
     """Enforce MNE filename conventions
 
     Parameters
@@ -249,20 +321,33 @@ def check_fname(fname, filetype, endings):
         Type of file. e.g., ICA, Epochs etc.
     endings : tuple
         Acceptable endings for the filename.
+    endings_err : tuple
+        Obligatory possible endings for the filename.
     """
+    if len(endings_err) > 0 and not fname.endswith(endings_err):
+        print_endings = ' or '.join([', '.join(endings_err[:-1]),
+                                     endings_err[-1]])
+        raise IOError('The filename (%s) for file type %s must end with %s'
+                      % (fname, filetype, print_endings))
     print_endings = ' or '.join([', '.join(endings[:-1]), endings[-1]])
     if not fname.endswith(endings):
-        warnings.warn('This filename (%s) does not conform to MNE naming '
-                      'conventions. All %s files should end with '
-                      '%s' % (fname, filetype, print_endings))
+        warn('This filename (%s) does not conform to MNE naming conventions. '
+             'All %s files should end with %s'
+             % (fname, filetype, print_endings))
 
 
 class WrapStdOut(object):
-    """Ridiculous class to work around how doctest captures stdout"""
+    """Dynamically wrap to sys.stdout
+
+    This makes packages that monkey-patch sys.stdout (e.g.doctest,
+    sphinx-gallery) work properly."""
     def __getattr__(self, name):
         # Even more ridiculous than this class, this must be sys.stdout (not
         # just stdout) in order for this to work (tested on OSX and Linux)
-        return getattr(sys.stdout, name)
+        if hasattr(sys.stdout, name):
+            return getattr(sys.stdout, name)
+        else:
+            raise AttributeError("'file' object has not attribute '%s'" % name)
 
 
 class _TempDir(str):
@@ -287,8 +372,8 @@ class _TempDir(str):
         rmtree(self._path, ignore_errors=True)
 
 
-def estimate_rank(data, tol=1e-4, return_singular=False,
-                  norm=True, copy=True):
+def estimate_rank(data, tol='auto', return_singular=False,
+                  norm=True, copy=None):
     """Helper to estimate the rank of data
 
     This function will normalize the rows of the data (typically
@@ -299,11 +384,12 @@ def estimate_rank(data, tol=1e-4, return_singular=False,
     ----------
     data : array
         Data to estimate the rank of (should be 2-dimensional).
-    tol : float
+    tol : float | str
         Tolerance for singular values to consider non-zero in
         calculating the rank. The singular values are calculated
         in this method such that independent data are expected to
-        have singular value around one.
+        have singular value around one. Can be 'auto' to use the
+        same thresholding as ``scipy.linalg.orth``.
     return_singular : bool
         If True, also return the singular values that were used
         to determine the rank.
@@ -311,8 +397,8 @@ def estimate_rank(data, tol=1e-4, return_singular=False,
         If True, data will be scaled by their estimated row-wise norm.
         Else data are assumed to be scaled. Defaults to True.
     copy : bool
-        If False, values in data will be modified in-place during
-        rank estimation (saves memory).
+        This parameter has been deprecated and will be removed in 0.13.
+        It is ignored in 0.12.
 
     Returns
     -------
@@ -322,13 +408,20 @@ def estimate_rank(data, tol=1e-4, return_singular=False,
         If return_singular is True, the singular values that were
         thresholded to determine the rank are also returned.
     """
-    if copy is True:
-        data = data.copy()
+    if copy is not None:
+        warn('copy is deprecated and ignored. It will be removed in 0.13.')
+    data = data.copy()  # operate on a copy
     if norm is True:
         norms = _compute_row_norms(data)
         data /= norms[:, np.newaxis]
     s = linalg.svd(data, compute_uv=False, overwrite_a=True)
-    rank = np.sum(s >= tol)
+    if isinstance(tol, string_types):
+        if tol != 'auto':
+            raise ValueError('tol must be "auto" or float')
+        eps = np.finfo(float).eps
+        tol = np.max(data.shape) * np.amax(s) * eps
+    tol = float(tol)
+    rank = np.sum(s > tol)
     if return_singular is True:
         return rank, s
     else:
@@ -408,7 +501,7 @@ def trait_wraith(*args, **kwargs):
 # Following deprecated class copied from scikit-learn
 
 # force show of DeprecationWarning even on python 2.7
-warnings.simplefilter('default')
+warnings.filterwarnings('always', category=DeprecationWarning, module='mne')
 
 
 class deprecated(object):
@@ -464,14 +557,14 @@ class deprecated(object):
         # FIXME: we should probably reset __new__ for full generality
         init = cls.__init__
 
-        def wrapped(*args, **kwargs):
+        def deprecation_wrapped(*args, **kwargs):
             warnings.warn(msg, category=DeprecationWarning)
             return init(*args, **kwargs)
-        cls.__init__ = wrapped
+        cls.__init__ = deprecation_wrapped
 
-        wrapped.__name__ = '__init__'
-        wrapped.__doc__ = self._update_doc(init.__doc__)
-        wrapped.deprecated_original = init
+        deprecation_wrapped.__name__ = '__init__'
+        deprecation_wrapped.__doc__ = self._update_doc(init.__doc__)
+        deprecation_wrapped.deprecated_original = init
 
         return cls
 
@@ -482,18 +575,18 @@ class deprecated(object):
         if self.extra:
             msg += "; %s" % self.extra
 
-        def wrapped(*args, **kwargs):
+        def deprecation_wrapped(*args, **kwargs):
             warnings.warn(msg, category=DeprecationWarning)
             return fun(*args, **kwargs)
 
-        wrapped.__name__ = fun.__name__
-        wrapped.__dict__ = fun.__dict__
-        wrapped.__doc__ = self._update_doc(fun.__doc__)
+        deprecation_wrapped.__name__ = fun.__name__
+        deprecation_wrapped.__dict__ = fun.__dict__
+        deprecation_wrapped.__doc__ = self._update_doc(fun.__doc__)
 
-        return wrapped
+        return deprecation_wrapped
 
     def _update_doc(self, olddoc):
-        newdoc = "DEPRECATED"
+        newdoc = ".. warning:: DEPRECATED"
         if self.extra:
             newdoc = "%s: %s" % (newdoc, self.extra)
         if olddoc:
@@ -518,7 +611,7 @@ def verbose(function, *args, **kwargs):
     dec : function
         The decorated function
     """
-    arg_names = inspect.getargspec(function).args
+    arg_names = _get_args(function)
     default_level = verbose_level = None
     if len(arg_names) > 0 and arg_names[0] == 'self':
         default_level = getattr(args[0], 'verbose', None)
@@ -531,13 +624,28 @@ def verbose(function, *args, **kwargs):
     verbose_level = default_level if verbose_level is None else verbose_level
 
     if verbose_level is not None:
-        old_level = set_log_level(verbose_level, True)
         # set it back if we get an exception
-        try:
+        with use_log_level(verbose_level):
             return function(*args, **kwargs)
-        finally:
-            set_log_level(old_level)
     return function(*args, **kwargs)
+
+
+class use_log_level(object):
+    """Context handler for logging level
+
+    Parameters
+    ----------
+    level : int
+        The level to use.
+    """
+    def __init__(self, level):
+        self.level = level
+
+    def __enter__(self):
+        self.old_level = set_log_level(self.level, True)
+
+    def __exit__(self, *args):
+        set_log_level(self.old_level)
 
 
 @nottest
@@ -597,14 +705,16 @@ def requires_nibabel(vox2ras_tkr=False):
                                  'Requires nibabel%s' % extra)
 
 
-def requires_scipy_version(min_version):
+def requires_version(library, min_version):
     """Helper for testing"""
-    return np.testing.dec.skipif(not check_scipy_version(min_version),
-                                 'Requires scipy version >= %s' % min_version)
+    return np.testing.dec.skipif(not check_version(library, min_version),
+                                 'Requires %s version >= %s'
+                                 % (library, min_version))
 
 
-def requires_module(function, name, call):
+def requires_module(function, name, call=None):
     """Decorator to skip test if package is not available"""
+    call = ('import %s' % name) if call is None else call
     try:
         from nose.plugins.skip import SkipTest
     except ImportError:
@@ -639,6 +749,14 @@ if version < required_version:
     raise ImportError
 """
 
+_sklearn_0_15_call = """
+required_version = '0.15'
+import sklearn
+version = LooseVersion(sklearn.__version__)
+if version < required_version:
+    raise ImportError
+"""
+
 _mayavi_call = """
 from mayavi import mlab
 mlab.options.backend = 'test'
@@ -666,6 +784,8 @@ if not has_nibabel() and not has_freesurfer():
 
 requires_pandas = partial(requires_module, name='pandas', call=_pandas_call)
 requires_sklearn = partial(requires_module, name='sklearn', call=_sklearn_call)
+requires_sklearn_0_15 = partial(requires_module, name='sklearn',
+                                call=_sklearn_0_15_call)
 requires_mayavi = partial(requires_module, name='mayavi', call=_mayavi_call)
 requires_mne = partial(requires_module, name='MNE-C', call=_mne_call)
 requires_freesurfer = partial(requires_module, name='Freesurfer',
@@ -677,10 +797,8 @@ requires_fs_or_nibabel = partial(requires_module, name='nibabel or Freesurfer',
 
 requires_tvtk = partial(requires_module, name='TVTK',
                         call='from tvtk.api import tvtk')
-requires_statsmodels = partial(requires_module, name='statsmodels',
-                               call='import statsmodels')
-requires_patsy = partial(requires_module, name='patsy',
-                         call='import patsy')
+requires_statsmodels = partial(requires_module, name='statsmodels')
+requires_patsy = partial(requires_module, name='patsy')
 requires_pysurfer = partial(requires_module, name='PySurfer',
                             call='from surfer import Brain')
 requires_PIL = partial(requires_module, name='PIL',
@@ -689,59 +807,77 @@ requires_good_network = partial(
     requires_module, name='good network connection',
     call='if int(os.environ.get("MNE_SKIP_NETWORK_TESTS", 0)):\n'
          '    raise ImportError')
-requires_nitime = partial(requires_module, name='nitime',
-                          call='import nitime')
-requires_traits = partial(requires_module, name='traits',
-                          call='import traits')
-requires_h5py = partial(requires_module, name='h5py', call='import h5py')
+requires_ftp = partial(
+    requires_module, name='ftp downloading capability',
+    call='if int(os.environ.get("MNE_SKIP_FTP_TESTS", 0)):\n'
+         '    raise ImportError')
+requires_nitime = partial(requires_module, name='nitime')
+requires_traits = partial(requires_module, name='traits')
+requires_h5py = partial(requires_module, name='h5py')
+requires_numpydoc = partial(requires_module, name='numpydoc')
 
 
-def _check_mayavi_version(min_version='4.3.0'):
-    """Raise a RuntimeError if the required version of mayavi is not available
-
-    Parameters
-    ----------
-    min_version : str
-        The version string. Anything that matches
-        ``'(\\d+ | [a-z]+ | \\.)'``
-    """
-    import mayavi
-    require_mayavi = LooseVersion(min_version)
-    if LooseVersion(mayavi.__version__) < require_mayavi:
-        raise RuntimeError("Need mayavi >= %s" % require_mayavi)
-
-
-def check_sklearn_version(min_version):
-    """Check minimum sklearn version required
+def check_version(library, min_version):
+    """Check minimum library version required
 
     Parameters
     ----------
+    library : str
+        The library name to import. Must have a ``__version__`` property.
     min_version : str
-        The version string. Anything that matches
+        The minimum version string. Anything that matches
         ``'(\\d+ | [a-z]+ | \\.)'``
+
+    Returns
+    -------
+    ok : bool
+        True if the library exists with at least the specified version.
     """
     ok = True
     try:
-        import sklearn
-        this_version = LooseVersion(sklearn.__version__)
-        if this_version < min_version:
-            ok = False
+        library = __import__(library)
     except ImportError:
         ok = False
+    else:
+        this_version = LooseVersion(library.__version__)
+        if this_version < min_version:
+            ok = False
     return ok
 
 
-def check_scipy_version(min_version):
-    """Check minimum sklearn version required
+def _check_mayavi_version(min_version='4.3.0'):
+    """Helper for mayavi"""
+    if not check_version('mayavi', min_version):
+        raise RuntimeError("Need mayavi >= %s" % min_version)
 
-    Parameters
-    ----------
-    min_version : str
-        The version string. Anything that matches
-        ``'(\\d+ | [a-z]+ | \\.)'``
+
+def _check_pyface_backend():
+    """Check the currently selected Pyface backend
+
+    Returns
+    -------
+    backend : str
+        Name of the backend.
+    result : 0 | 1 | 2
+        0: the backend has been tested and works.
+        1: the backend has not been tested.
+        2: the backend not been tested.
+
+    Notes
+    -----
+    See also: http://docs.enthought.com/pyface/
     """
-    this_version = LooseVersion(scipy.__version__)
-    return False if this_version < min_version else True
+    try:
+        from traits.trait_base import ETSConfig
+    except ImportError:
+        return None, 2
+
+    backend = ETSConfig.toolkit
+    if backend == 'qt4':
+        status = 0
+    else:
+        status = 1
+    return backend, status
 
 
 @verbose
@@ -770,20 +906,25 @@ def run_subprocess(command, verbose=None, *args, **kwargs):
     stderr : str
         Stderr returned by the process.
     """
-    if 'stderr' not in kwargs:
-        kwargs['stderr'] = subprocess.PIPE
-    if 'stdout' not in kwargs:
-        kwargs['stdout'] = subprocess.PIPE
+    for stdxxx, sys_stdxxx in (['stderr', sys.stderr],
+                               ['stdout', sys.stdout]):
+        if stdxxx not in kwargs:
+            kwargs[stdxxx] = subprocess.PIPE
+        elif kwargs[stdxxx] is sys_stdxxx:
+            if isinstance(sys_stdxxx, StringIO):
+                # nose monkey patches sys.stderr and sys.stdout to StringIO
+                kwargs[stdxxx] = subprocess.PIPE
+            else:
+                kwargs[stdxxx] = sys_stdxxx
 
     # Check the PATH environment variable. If run_subprocess() is to be called
     # frequently this should be refactored so as to only check the path once.
     env = kwargs.get('env', os.environ)
     if any(p.startswith('~') for p in env['PATH'].split(os.pathsep)):
-        msg = ("Your PATH environment variable contains at least one path "
-               "starting with a tilde ('~') character. Such paths are not "
-               "interpreted correctly from within Python. It is recommended "
-               "that you use '$HOME' instead of '~'.")
-        warnings.warn(msg)
+        warn('Your PATH environment variable contains at least one path '
+             'starting with a tilde ("~") character. Such paths are not '
+             'interpreted correctly from within Python. It is recommended '
+             'that you use "$HOME" instead of "~".')
 
     logger.info("Running subprocess: %s" % ' '.join(command))
     try:
@@ -804,7 +945,7 @@ def run_subprocess(command, verbose=None, *args, **kwargs):
     if p.returncode:
         print(output)
         err_fun = subprocess.CalledProcessError.__init__
-        if 'output' in inspect.getargspec(err_fun).args:
+        if 'output' in _get_args(err_fun):
             raise subprocess.CalledProcessError(p.returncode, command, output)
         else:
             raise subprocess.CalledProcessError(p.returncode, command)
@@ -865,7 +1006,7 @@ def set_log_file(fname=None, output_format='%(message)s', overwrite=None):
             https://docs.python.org/dev/howto/logging.html
 
         e.g., "%(asctime)s - %(levelname)s - %(message)s".
-    overwrite : bool, or None
+    overwrite : bool | None
         Overwrite the log file (if it exists). Otherwise, statements
         will be appended to the log (default). None is the same as False,
         but additionally raises a warning to notify the user that log
@@ -874,15 +1015,20 @@ def set_log_file(fname=None, output_format='%(message)s', overwrite=None):
     logger = logging.getLogger('mne')
     handlers = logger.handlers
     for h in handlers:
-        if isinstance(h, logging.FileHandler):
-            h.close()
-        logger.removeHandler(h)
+        # only remove our handlers (get along nicely with nose)
+        if isinstance(h, (logging.FileHandler, logging.StreamHandler)):
+            if isinstance(h, logging.FileHandler):
+                h.close()
+            logger.removeHandler(h)
     if fname is not None:
         if op.isfile(fname) and overwrite is None:
+            # Don't use warn() here because we just want to
+            # emit a warnings.warn here (not logger.warn)
             warnings.warn('Log entries will be appended to the file. Use '
                           'overwrite=False to avoid this message in the '
-                          'future.')
-        mode = 'w' if overwrite is True else 'a'
+                          'future.', RuntimeWarning, stacklevel=2)
+            overwrite = False
+        mode = 'w' if overwrite else 'a'
         lh = logging.FileHandler(fname, mode=mode)
     else:
         """ we should just be able to do:
@@ -894,6 +1040,26 @@ def set_log_file(fname=None, output_format='%(message)s', overwrite=None):
     lh.setFormatter(logging.Formatter(output_format))
     # actually add the stream handler
     logger.addHandler(lh)
+
+
+class catch_logging(object):
+    """Helper to store logging
+
+    This will remove all other logging handlers, and return the handler to
+    stdout when complete.
+    """
+    def __enter__(self):
+        self._data = StringIO()
+        self._lh = logging.StreamHandler(self._data)
+        self._lh.setFormatter(logging.Formatter('%(message)s'))
+        for lh in logger.handlers:
+            logger.removeHandler(lh)
+        logger.addHandler(self._lh)
+        return self._data
+
+    def __exit__(self, *args):
+        logger.removeHandler(self._lh)
+        set_log_file(None)
 
 
 ###############################################################################
@@ -1016,29 +1182,52 @@ def set_memmap_min_size(memmap_min_size):
 
 
 # List the known configuration values
-known_config_types = [
+known_config_types = (
     'MNE_BROWSE_RAW_SIZE',
+    'MNE_CACHE_DIR',
     'MNE_CUDA_IGNORE_PRECISION',
     'MNE_DATA',
+    'MNE_DATASETS_BRAINSTORM_PATH',
+    'MNE_DATASETS_EEGBCI_PATH',
     'MNE_DATASETS_MEGSIM_PATH',
+    'MNE_DATASETS_MISC_PATH',
     'MNE_DATASETS_SAMPLE_PATH',
     'MNE_DATASETS_SOMATO_PATH',
+    'MNE_DATASETS_SPM_FACE_DATASETS_TESTS',
     'MNE_DATASETS_SPM_FACE_PATH',
-    'MNE_DATASETS_EEGBCI_PATH',
     'MNE_DATASETS_TESTING_PATH',
+    'MNE_FORCE_SERIAL',
     'MNE_LOGGING_LEVEL',
-    'MNE_USE_CUDA',
-    'SUBJECTS_DIR',
-    'MNE_CACHE_DIR',
     'MNE_MEMMAP_MIN_SIZE',
+    'MNE_SKIP_FTP_TESTS',
+    'MNE_SKIP_NETWORK_TESTS',
     'MNE_SKIP_TESTING_DATASET_TESTS',
-    'MNE_DATASETS_SPM_FACE_DATASETS_TESTS'
-]
+    'MNE_STIM_CHANNEL',
+    'MNE_USE_CUDA',
+    'MNE_SKIP_FS_FLASH_CALL',
+    'SUBJECTS_DIR',
+)
 
 # These allow for partial matches, e.g. 'MNE_STIM_CHANNEL_1' is okay key
-known_config_wildcards = [
+known_config_wildcards = (
     'MNE_STIM_CHANNEL',
-]
+)
+
+
+def _load_config(config_path, raise_error=False):
+    """Helper to safely load a config file"""
+    with open(config_path, 'r') as fid:
+        try:
+            config = json.load(fid)
+        except ValueError:
+            # No JSON object could be decoded --> corrupt file?
+            msg = ('The MNE-Python config file (%s) is not a valid JSON '
+                   'file and might be corrupted' % config_path)
+            if raise_error:
+                raise RuntimeError(msg)
+            warn(msg)
+            config = dict()
+    return config
 
 
 def get_config(key=None, default=None, raise_error=False, home_dir=None):
@@ -1063,6 +1252,10 @@ def get_config(key=None, default=None, raise_error=False, home_dir=None):
     -------
     value : dict | str | None
         The preference key value.
+
+    See Also
+    --------
+    set_config
     """
 
     if key is not None and not isinstance(key, string_types):
@@ -1078,13 +1271,11 @@ def get_config(key=None, default=None, raise_error=False, home_dir=None):
         key_found = False
         val = default
     else:
-        with open(config_path, 'r') as fid:
-            config = json.load(fid)
-            if key is None:
-                return config
+        config = _load_config(config_path)
+        if key is None:
+            return config
         key_found = key in config
         val = config.get(key, default)
-
     if not key_found and raise_error is True:
         meth_1 = 'os.environ["%s"] = VALUE' % key
         meth_2 = 'mne.utils.set_config("%s", VALUE)' % key
@@ -1104,15 +1295,22 @@ def set_config(key, value, home_dir=None):
 
     Parameters
     ----------
-    key : str
-        The preference key to set.
+    key : str | None
+        The preference key to set. If None, a tuple of the valid
+        keys is returned, and ``value`` and ``home_dir`` are ignored.
     value : str |  None
         The value to assign to the preference key. If None, the key is
         deleted.
     home_dir : str | None
         The folder that contains the .mne config folder.
         If None, it is found automatically.
+
+    See Also
+    --------
+    get_config
     """
+    if key is None:
+        return known_config_types
     if not isinstance(key, string_types):
         raise TypeError('key must be a string')
     # While JSON allow non-string types, we allow users to override config
@@ -1121,13 +1319,12 @@ def set_config(key, value, home_dir=None):
         raise TypeError('value must be a string or None')
     if key not in known_config_types and not \
             any(k in key for k in known_config_wildcards):
-        warnings.warn('Setting non-standard config type: "%s"' % key)
+        warn('Setting non-standard config type: "%s"' % key)
 
     # Read all previous values
     config_path = get_config_path(home_dir=home_dir)
     if op.isfile(config_path):
-        with open(config_path, 'r') as fid:
-            config = json.load(fid)
+        config = _load_config(config_path, raise_error=True)
     else:
         config = dict()
         logger.info('Attempting to create new mne-python configuration '
@@ -1190,7 +1387,7 @@ class ProgressBar(object):
     def __init__(self, max_value, initial_value=0, mesg='', max_chars=40,
                  progress_character='.', spinner=False, verbose_bool=True):
         self.cur_value = initial_value
-        self.max_value = float(max_value)
+        self.max_value = max_value
         self.mesg = mesg
         self.max_chars = max_chars
         self.progress_character = progress_character
@@ -1222,6 +1419,9 @@ class ProgressBar(object):
 
         # Update the message
         if mesg is not None:
+            if mesg == 'file_sizes':
+                mesg = '(%s / %s)' % (sizeof_fmt(self.cur_value),
+                                      sizeof_fmt(self.max_value))
             self.mesg = mesg
 
         # The \r tells the cursor to return to the beginning of the line rather
@@ -1260,55 +1460,8 @@ class ProgressBar(object):
         self.update(self.cur_value, mesg)
 
 
-def _chunk_read(response, local_file, initial_size=0, verbose_bool=True):
-    """Download a file chunk by chunk and show advancement
-
-    Can also be used when resuming downloads over http.
-
-    Parameters
-    ----------
-    response: urllib.response.addinfourl
-        Response to the download request in order to get file size.
-    local_file: file
-        Hard disk file where data should be written.
-    initial_size: int, optional
-        If resuming, indicate the initial size of the file.
-
-    Notes
-    -----
-    The chunk size will be automatically adapted based on the connection
-    speed.
-    """
-    # Adapted from NISL:
-    # https://github.com/nisl/tutorial/blob/master/nisl/datasets.py
-
-    # Returns only amount left to download when resuming, not the size of the
-    # entire file
-    total_size = int(response.headers.get('Content-Length', '1').strip())
-    total_size += initial_size
-
-    progress = ProgressBar(total_size, initial_value=initial_size,
-                           max_chars=40, spinner=True, mesg='downloading',
-                           verbose_bool=verbose_bool)
-    chunk_size = 8192  # 2 ** 13
-    while True:
-        t0 = time.time()
-        chunk = response.read(chunk_size)
-        dt = time.time() - t0
-        if dt < 0.001:
-            chunk_size *= 2
-        elif dt > 0.5 and chunk_size > 8192:
-            chunk_size = chunk_size // 2
-        if not chunk:
-            if verbose_bool:
-                sys.stdout.write('\n')
-                sys.stdout.flush()
-            break
-        _chunk_write(chunk, local_file, progress)
-
-
-def _chunk_read_ftp_resume(url, temp_file_name, local_file, verbose_bool=True):
-    """Resume downloading of a file from an FTP server"""
+def _get_ftp(url, temp_file_name, initial_size, file_size, verbose_bool):
+    """Safely (resume a) download to a file from FTP"""
     # Adapted from: https://pypi.python.org/pypi/fileDownloader.py
     # but with changes
 
@@ -1316,7 +1469,6 @@ def _chunk_read_ftp_resume(url, temp_file_name, local_file, verbose_bool=True):
     file_name = os.path.basename(parsed_url.path)
     server_path = parsed_url.path.replace(file_name, "")
     unquoted_server_path = urllib.parse.unquote(server_path)
-    local_file_size = os.path.getsize(temp_file_name)
 
     data = ftplib.FTP()
     if parsed_url.port is not None:
@@ -1327,21 +1479,73 @@ def _chunk_read_ftp_resume(url, temp_file_name, local_file, verbose_bool=True):
     if len(server_path) > 1:
         data.cwd(unquoted_server_path)
     data.sendcmd("TYPE I")
-    data.sendcmd("REST " + str(local_file_size))
+    data.sendcmd("REST " + str(initial_size))
     down_cmd = "RETR " + file_name
-    file_size = data.size(file_name)
-    progress = ProgressBar(file_size, initial_value=local_file_size,
-                           max_chars=40, spinner=True, mesg='downloading',
+    assert file_size == data.size(file_name)
+    progress = ProgressBar(file_size, initial_value=initial_size,
+                           max_chars=40, spinner=True, mesg='file_sizes',
                            verbose_bool=verbose_bool)
 
     # Callback lambda function that will be passed the downloaded data
     # chunk and will write it to file and update the progress bar
-    def chunk_write(chunk):
-        return _chunk_write(chunk, local_file, progress)
-    data.retrbinary(down_cmd, chunk_write)
-    data.close()
+    mode = 'ab' if initial_size > 0 else 'wb'
+    with open(temp_file_name, mode) as local_file:
+        def chunk_write(chunk):
+            return _chunk_write(chunk, local_file, progress)
+        data.retrbinary(down_cmd, chunk_write)
+        data.close()
     sys.stdout.write('\n')
     sys.stdout.flush()
+
+
+def _get_http(url, temp_file_name, initial_size, file_size, verbose_bool):
+    """Safely (resume a) download to a file from http(s)"""
+    # Actually do the reading
+    req = urllib.request.Request(url)
+    if initial_size > 0:
+        req.headers['Range'] = 'bytes=%s-' % (initial_size,)
+    try:
+        response = urllib.request.urlopen(req)
+    except Exception:
+        # There is a problem that may be due to resuming, some
+        # servers may not support the "Range" header. Switch
+        # back to complete download method
+        logger.info('Resuming download failed (server '
+                    'rejected the request). Attempting to '
+                    'restart downloading the entire file.')
+        del req.headers['Range']
+        response = urllib.request.urlopen(req)
+    total_size = int(response.headers.get('Content-Length', '1').strip())
+    if initial_size > 0 and file_size == total_size:
+        logger.info('Resuming download failed (resume file size '
+                    'mismatch). Attempting to restart downloading the '
+                    'entire file.')
+        initial_size = 0
+    total_size += initial_size
+    if total_size != file_size:
+        raise RuntimeError('URL could not be parsed properly')
+    mode = 'ab' if initial_size > 0 else 'wb'
+    progress = ProgressBar(total_size, initial_value=initial_size,
+                           max_chars=40, spinner=True, mesg='file_sizes',
+                           verbose_bool=verbose_bool)
+    chunk_size = 8192  # 2 ** 13
+    with open(temp_file_name, mode) as local_file:
+        while True:
+            t0 = time.time()
+            chunk = response.read(chunk_size)
+            dt = time.time() - t0
+            if dt < 0.005:
+                chunk_size *= 2
+            elif dt > 0.1 and chunk_size > 8192:
+                chunk_size = chunk_size // 2
+            if not chunk:
+                if verbose_bool:
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                break
+            local_file.write(chunk)
+            progress.update_with_increment_value(len(chunk),
+                                                 mesg='file_sizes')
 
 
 def _chunk_write(chunk, local_file, progress):
@@ -1352,7 +1556,7 @@ def _chunk_write(chunk, local_file, progress):
 
 @verbose
 def _fetch_file(url, file_name, print_destination=True, resume=True,
-                hash_=None, verbose=None):
+                hash_=None, timeout=10., verbose=None):
     """Load requested file, downloading it if needed or requested
 
     Parameters
@@ -1369,6 +1573,8 @@ def _fetch_file(url, file_name, print_destination=True, resume=True,
     hash_ : str | None
         The hash of the file to check. If None, no checking is
         performed.
+    timeout : float
+        The URL open timeout.
     verbose : bool, str, int, or None
         If not None, override default verbose level (see mne.verbose).
     """
@@ -1379,12 +1585,14 @@ def _fetch_file(url, file_name, print_destination=True, resume=True,
         raise ValueError('Bad hash value given, should be a 32-character '
                          'string:\n%s' % (hash_,))
     temp_file_name = file_name + ".part"
-    local_file = None
-    initial_size = 0
     verbose_bool = (logger.level <= 20)  # 20 is info
     try:
-        # Checking file size and displaying it alongside the download url
-        u = urllib.request.urlopen(url, timeout=10.)
+        # Check file size and displaying it alongside the download url
+        u = urllib.request.urlopen(url, timeout=timeout)
+        u.close()
+        # this is necessary to follow any redirects
+        url = u.geturl()
+        u = urllib.request.urlopen(url, timeout=timeout)
         try:
             file_size = int(u.headers.get('Content-Length', '1').strip())
         finally:
@@ -1392,45 +1600,28 @@ def _fetch_file(url, file_name, print_destination=True, resume=True,
             del u
         logger.info('Downloading data from %s (%s)\n'
                     % (url, sizeof_fmt(file_size)))
-        # Downloading data
-        if resume and os.path.exists(temp_file_name):
-            local_file = open(temp_file_name, "ab")
-            # Resuming HTTP and FTP downloads requires different procedures
-            scheme = urllib.parse.urlparse(url).scheme
-            if scheme in ('http', 'https'):
-                local_file_size = os.path.getsize(temp_file_name)
-                # If the file exists, then only download the remainder
-                req = urllib.request.Request(url)
-                req.headers["Range"] = "bytes=%s-" % local_file_size
-                try:
-                    data = urllib.request.urlopen(req)
-                except Exception:
-                    # There is a problem that may be due to resuming, some
-                    # servers may not support the "Range" header. Switch back
-                    # to complete download method
-                    logger.info('Resuming download failed. Attempting to '
-                                'restart downloading the entire file.')
-                    _fetch_file(url, resume=False)
-                else:
-                    _chunk_read(data, local_file, initial_size=local_file_size,
-                                verbose_bool=verbose_bool)
-                    data.close()
-                    del data  # should auto-close
-            else:
-                _chunk_read_ftp_resume(url, temp_file_name, local_file,
-                                       verbose_bool=verbose_bool)
+
+        # Triage resume
+        if not os.path.exists(temp_file_name):
+            resume = False
+        if resume:
+            with open(temp_file_name, 'rb', buffering=0) as local_file:
+                local_file.seek(0, 2)
+                initial_size = local_file.tell()
+            del local_file
         else:
-            local_file = open(temp_file_name, "wb")
-            data = urllib.request.urlopen(url)
-            try:
-                _chunk_read(data, local_file, initial_size=initial_size,
-                            verbose_bool=verbose_bool)
-            finally:
-                data.close()
-                del data  # should auto-close
-        # temp file must be closed prior to the move
-        if not local_file.closed:
-            local_file.close()
+            initial_size = 0
+        # This should never happen if our functions work properly
+        if initial_size > file_size:
+            raise RuntimeError('Local file (%s) is larger than remote '
+                               'file (%s), cannot resume download'
+                               % (sizeof_fmt(initial_size),
+                                  sizeof_fmt(file_size)))
+
+        scheme = urllib.parse.urlparse(url).scheme
+        fun = _get_http if scheme in ('http', 'https') else _get_ftp
+        fun(url, temp_file_name, initial_size, file_size, verbose_bool)
+
         # check md5sum
         if hash_ is not None:
             logger.info('Verifying download hash.')
@@ -1442,15 +1633,10 @@ def _fetch_file(url, file_name, print_destination=True, resume=True,
         shutil.move(temp_file_name, file_name)
         if print_destination is True:
             logger.info('File saved as %s.\n' % file_name)
-    except Exception as e:
+    except Exception:
         logger.error('Error while fetching file %s.'
                      ' Dataset fetching aborted.' % url)
-        logger.error("Error: %s", e)
         raise
-    finally:
-        if local_file is not None:
-            if not local_file.closed:
-                local_file.close()
 
 
 def sizeof_fmt(num):
@@ -1482,7 +1668,7 @@ def _url_to_local_path(url, path):
     return destination
 
 
-def _get_stim_channel(stim_channel, info):
+def _get_stim_channel(stim_channel, info, raise_error=True):
     """Helper to determine the appropriate stim_channel
 
     First, 'MNE_STIM_CHANNEL', 'MNE_STIM_CHANNEL_1', 'MNE_STIM_CHANNEL_2', etc.
@@ -1521,22 +1707,24 @@ def _get_stim_channel(stim_channel, info):
         return stim_channel
 
     if 'STI 014' in info['ch_names']:
-        return 'STI 014'
+        return ['STI 014']
 
     from .io.pick import pick_types
     stim_channel = pick_types(info, meg=False, ref_meg=False, stim=True)
     if len(stim_channel) > 0:
         stim_channel = [info['ch_names'][ch_] for ch_ in stim_channel]
-        return stim_channel
+    elif raise_error:
+        raise ValueError("No stim channels found. Consider specifying them "
+                         "manually using the 'stim_channel' parameter.")
+    return stim_channel
 
-    raise ValueError("No stim channels found. Consider specifying them "
-                     "manually using the 'stim_channel' parameter.")
 
-
-def _check_fname(fname, overwrite):
+def _check_fname(fname, overwrite=False, must_exist=False):
     """Helper to check for file existence"""
     if not isinstance(fname, string_types):
         raise TypeError('file name is not a string')
+    if must_exist and not op.isfile(fname):
+        raise IOError('File "%s" does not exist' % fname)
     if op.isfile(fname):
         if not overwrite:
             raise IOError('Destination file exists. Please use option '
@@ -1743,7 +1931,7 @@ def md5sum(fname, block_size=1048576):  # 2 ** 20
     Returns
     -------
     hash_ : str
-        The hexidecimal digest of the hash.
+        The hexadecimal digest of the hash.
     """
     md5 = hashlib.md5()
     with open(fname, 'rb') as fid:
@@ -1753,15 +1941,6 @@ def md5sum(fname, block_size=1048576):  # 2 ** 20
                 break
             md5.update(data)
     return md5.hexdigest()
-
-
-def _sphere_to_cartesian(theta, phi, r):
-    """Transform spherical coordinates to cartesian"""
-    z = r * np.sin(phi)
-    rcos_phi = r * np.cos(phi)
-    x = rcos_phi * np.cos(theta)
-    y = rcos_phi * np.sin(theta)
-    return x, y, z
 
 
 def create_slices(start, stop, step=None, length=1):
@@ -1795,16 +1974,40 @@ def create_slices(start, stop, step=None, length=1):
     return slices
 
 
-def _time_mask(times, tmin=None, tmax=None, strict=False):
+def _time_mask(times, tmin=None, tmax=None, sfreq=None, raise_error=True):
     """Helper to safely find sample boundaries"""
+    orig_tmin = tmin
+    orig_tmax = tmax
     tmin = -np.inf if tmin is None else tmin
     tmax = np.inf if tmax is None else tmax
+    if not np.isfinite(tmin):
+        tmin = times[0]
+    if not np.isfinite(tmax):
+        tmax = times[-1]
+    if sfreq is not None:
+        # Push to a bit past the nearest sample boundary first
+        sfreq = float(sfreq)
+        tmin = int(round(tmin * sfreq)) / sfreq - 0.5 / sfreq
+        tmax = int(round(tmax * sfreq)) / sfreq + 0.5 / sfreq
+    if raise_error and tmin > tmax:
+        raise ValueError('tmin (%s) must be less than or equal to tmax (%s)'
+                         % (orig_tmin, orig_tmax))
     mask = (times >= tmin)
     mask &= (times <= tmax)
-    if not strict:
-        mask |= isclose(times, tmin)
-        mask |= isclose(times, tmax)
+    if raise_error and not mask.any():
+        raise ValueError('No samples remain when using tmin=%s and tmax=%s '
+                         '(original time bounds are [%s, %s])'
+                         % (orig_tmin, orig_tmax, times[0], times[-1]))
     return mask
+
+
+def _get_fast_dot():
+    """"Helper to get fast dot"""
+    try:
+        from sklearn.utils.extmath import fast_dot
+    except ImportError:
+        fast_dot = np.dot
+    return fast_dot
 
 
 def random_permutation(n_samples, random_state=None):
@@ -1843,3 +2046,182 @@ def random_permutation(n_samples, random_state=None):
     randperm = np.argsort(idx)
 
     return randperm
+
+
+def compute_corr(x, y):
+    """Compute pearson correlations between a vector and a matrix"""
+    if len(x) == 0 or len(y) == 0:
+        raise ValueError('x or y has zero length')
+    fast_dot = _get_fast_dot()
+    X = np.array(x, float)
+    Y = np.array(y, float)
+    X -= X.mean(0)
+    Y -= Y.mean(0)
+    x_sd = X.std(0, ddof=1)
+    # if covariance matrix is fully expanded, Y needs a
+    # transpose / broadcasting else Y is correct
+    y_sd = Y.std(0, ddof=1)[:, None if X.shape == Y.shape else Ellipsis]
+    return (fast_dot(X.T, Y) / float(len(X) - 1)) / (x_sd * y_sd)
+
+
+def grand_average(all_inst, interpolate_bads=True, drop_bads=True):
+    """Make grand average of a list evoked or AverageTFR data
+
+    For evoked data, the function interpolates bad channels based on
+    `interpolate_bads` parameter. If `interpolate_bads` is True, the grand
+    average file will contain good channels and the bad channels interpolated
+    from the good MEG/EEG channels.
+    For AverageTFR data, the function takes the subset of channels not marked
+    as bad in any of the instances.
+
+    The grand_average.nave attribute will be equal to the number
+    of evoked datasets used to calculate the grand average.
+
+    Note: Grand average evoked should not be used for source localization.
+
+    Parameters
+    ----------
+    all_inst : list of Evoked or AverageTFR data
+        The evoked datasets.
+    interpolate_bads : bool
+        If True, bad MEG and EEG channels are interpolated. Ignored for
+        AverageTFR.
+    drop_bads : bool
+        If True, drop all bad channels marked as bad in any data set.
+        If neither interpolate_bads nor drop_bads is True, in the output file,
+        every channel marked as bad in at least one of the input files will be
+        marked as bad, but no interpolation or dropping will be performed.
+
+    Returns
+    -------
+    grand_average : Evoked | AverageTFR
+        The grand average data. Same type as input.
+
+    Notes
+    -----
+    .. versionadded:: 0.11.0
+    """
+    # check if all elements in the given list are evoked data
+    from .evoked import Evoked
+    from .time_frequency import AverageTFR
+    from .channels.channels import equalize_channels
+    if not any([(all(isinstance(inst, t) for inst in all_inst)
+                for t in (Evoked, AverageTFR))]):
+        raise ValueError("Not all input elements are Evoked or AverageTFR")
+
+    # Copy channels to leave the original evoked datasets intact.
+    all_inst = [inst.copy() for inst in all_inst]
+
+    # Interpolates if necessary
+    if isinstance(all_inst[0], Evoked):
+        if interpolate_bads:
+            all_inst = [inst.interpolate_bads() if len(inst.info['bads']) > 0
+                        else inst for inst in all_inst]
+        equalize_channels(all_inst)  # apply equalize_channels
+        from .evoked import combine_evoked as combine
+    elif isinstance(all_inst[0], AverageTFR):
+        from .time_frequency.tfr import combine_tfr as combine
+
+    if drop_bads:
+        bads = list(set((b for inst in all_inst for b in inst.info['bads'])))
+        if bads:
+            for inst in all_inst:
+                inst.drop_channels(bads)
+
+    # make grand_average object using combine_[evoked/tfr]
+    grand_average = combine(all_inst, weights='equal')
+    # change the grand_average.nave to the number of Evokeds
+    grand_average.nave = len(all_inst)
+    # change comment field
+    grand_average.comment = "Grand average (n = %d)" % grand_average.nave
+    return grand_average
+
+
+def _get_root_dir():
+    """Helper to get as close to the repo root as possible"""
+    root_dir = op.abspath(op.dirname(__file__))
+    up_dir = op.join(root_dir, '..')
+    if op.isfile(op.join(up_dir, 'setup.py')) and all(
+            op.isdir(op.join(up_dir, x)) for x in ('mne', 'examples', 'doc')):
+        root_dir = op.abspath(up_dir)
+    return root_dir
+
+
+def sys_info(fid=None, show_paths=False):
+    """Print the system information for debugging
+
+    This function is useful for printing system information
+    to help triage bugs.
+
+    Parameters
+    ----------
+    fid : file-like | None
+        The file to write to. Will be passed to :func:`print()`.
+        Can be None to use :data:`sys.stdout`.
+    show_paths : bool
+        If True, print paths for each module.
+
+    Examples
+    --------
+    Running this function with no arguments prints an output that is
+    useful when submitting bug reports::
+
+        >>> import mne
+        >>> mne.sys_info() # doctest: +SKIP
+        Platform:      Linux-4.2.0-27-generic-x86_64-with-Ubuntu-15.10-wily
+        Python:        2.7.10 (default, Oct 14 2015, 16:09:02)  [GCC 5.2.1 20151010]
+        Executable:    /usr/bin/python
+
+        mne:           0.12.dev0
+        numpy:         1.12.0.dev0+ec5bd81 {lapack=mkl_rt, blas=mkl_rt}
+        scipy:         0.18.0.dev0+3deede3
+        matplotlib:    1.5.1+1107.g1fa2697
+
+        sklearn:       0.18.dev0
+        nibabel:       2.1.0dev
+        nitime:        0.6
+        mayavi:        4.3.1
+        nose:          1.3.7
+        pandas:        0.17.1+25.g547750a
+        pycuda:        2015.1.3
+        skcuda:        0.5.2
+
+    """  # noqa
+    ljust = 15
+    out = 'Platform:'.ljust(ljust) + platform.platform() + '\n'
+    out += 'Python:'.ljust(ljust) + str(sys.version).replace('\n', ' ') + '\n'
+    out += 'Executable:'.ljust(ljust) + sys.executable + '\n\n'
+    old_stdout = sys.stdout
+    capture = StringIO()
+    try:
+        sys.stdout = capture
+        np.show_config()
+    finally:
+        sys.stdout = old_stdout
+    lines = capture.getvalue().split('\n')
+    libs = []
+    for li, line in enumerate(lines):
+        for key in ('lapack', 'blas'):
+            if line.startswith('%s_opt_info' % key):
+                libs += ['%s=' % key +
+                         lines[li + 1].split('[')[1].split("'")[1]]
+    libs = ', '.join(libs)
+    version_texts = dict(pycuda='VERSION_TEXT')
+    for mod_name in ('mne', 'numpy', 'scipy', 'matplotlib', '',
+                     'sklearn', 'nibabel', 'nitime', 'mayavi', 'nose',
+                     'pandas', 'pycuda', 'skcuda'):
+        if mod_name == '':
+            out += '\n'
+            continue
+        out += ('%s:' % mod_name).ljust(ljust)
+        try:
+            mod = __import__(mod_name)
+        except Exception:
+            out += 'Not found\n'
+        else:
+            version = getattr(mod, version_texts.get(mod_name, '__version__'))
+            extra = (' (%s)' % op.dirname(mod.__file__)) if show_paths else ''
+            if mod_name == 'numpy':
+                extra = ' {%s}%s' % (libs, extra)
+            out += '%s%s\n' % (version, extra)
+    print(out, end='', file=fid)

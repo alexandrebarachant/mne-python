@@ -39,7 +39,7 @@ event_fname = data_path + '/MEG/sample/sample_audvis_filt-0-40_raw-eve.fif'
 event_id, tmin, tmax = 1, -0.2, 0.5
 
 # Setup for reading the raw data
-raw = io.Raw(raw_fname)
+raw = io.read_raw_fif(raw_fname)
 events = mne.read_events(event_fname)
 
 # Set up pick list: EEG + MEG - bad channels (modify to your needs)
@@ -71,5 +71,5 @@ good_pick = 97  # channel with a clear evoked response
 bad_pick = 98  # channel with no evoked response
 
 plt.close('all')
-mne.viz.plot_image_epochs(epochs, [good_pick, bad_pick], sigma=0.5, vmin=-100,
+mne.viz.plot_epochs_image(epochs, [good_pick, bad_pick], sigma=0.5, vmin=-100,
                           vmax=250, colorbar=True, order=order_func, show=True)

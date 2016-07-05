@@ -3,11 +3,16 @@
  XDAWN Denoising
 ================
 
-Xdawn filters are trained from epochs, signal is projected in the sources
+XDAWN filters are trained from epochs, signal is projected in the sources
 space and then projected back in the sensor space using only the first two
-xdawn components. The process is similar to an ICA, but is
+XDAWN components. The process is similar to an ICA, but is
 supervised in order to maximize the signal to signal + noise ratio of the
 evoked response.
+
+WARNING: As this denoising method exploits the known events to
+maximize SNR of the contrast between conditions it can lead to overfit.
+To avoid a statistical analysis problem you should split epochs used
+in fit with the ones used in apply method.
 
 References
 ----------
@@ -26,11 +31,11 @@ efficient sensor selection in a P300 BCI. In Signal Processing Conference,
 # License: BSD (3-clause)
 
 
-from mne import (io, compute_raw_data_covariance, read_events, pick_types,
+from mne import (io, compute_raw_covariance, read_events, pick_types,
                  Epochs)
 from mne.datasets import sample
 from mne.preprocessing import Xdawn
-from mne.viz import plot_image_epochs
+from mne.viz import plot_epochs_image
 
 print(__doc__)
 
@@ -44,7 +49,7 @@ tmin, tmax = -0.1, 0.3
 event_id = dict(vis_r=4)
 
 # Setup for reading the raw data
-raw = io.Raw(raw_fname, preload=True)
+raw = io.read_raw_fif(raw_fname, preload=True)
 raw.filter(1, 20, method='iir')  # replace baselining with high-pass
 events = read_events(event_fname)
 
@@ -57,10 +62,10 @@ epochs = Epochs(raw, events, event_id, tmin, tmax, proj=False,
                 add_eeg_ref=False, verbose=False)
 
 # Plot image epoch before xdawn
-plot_image_epochs(epochs['vis_r'], picks=[230], vmin=-500, vmax=500)
+plot_epochs_image(epochs['vis_r'], picks=[230], vmin=-500, vmax=500)
 
 # Estimates signal covariance
-signal_cov = compute_raw_data_covariance(raw, picks=picks)
+signal_cov = compute_raw_covariance(raw, picks=picks)
 
 # Xdawn instance
 xd = Xdawn(n_components=2, signal_cov=signal_cov)
@@ -72,4 +77,4 @@ xd.fit(epochs)
 epochs_denoised = xd.apply(epochs)
 
 # Plot image epoch after xdawn
-plot_image_epochs(epochs_denoised['vis_r'], picks=[230], vmin=-500, vmax=500)
+plot_epochs_image(epochs_denoised['vis_r'], picks=[230], vmin=-500, vmax=500)
