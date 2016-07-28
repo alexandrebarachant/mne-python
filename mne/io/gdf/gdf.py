@@ -99,20 +99,22 @@ class RawGDF(_BaseRaw):
     def __init__(self, input_fname, montage, eog=None, misc=None,
                  stim_channel=-1,
                  preload=False, verbose=None):
-        logger.info('Extracting gdf Parameters from %s...' % input_fname)
+        logger.info('Extracting edf Parameters from %s...' % input_fname)
         input_fname = os.path.abspath(input_fname)
-        info, self._gdf_info = _get_gdf_info(input_fname, stim_channel,
-                                             eog, misc, preload)
+        info, gdf_info = _get_gdf_info(input_fname, stim_channel,
+                                       eog, misc, preload)
         logger.info('Creating Raw.info structure...')
         _check_update_montage(info, montage)
 
         # Raw attributes
-        last_samps = [self._gdf_info['nsamples'] - 1]
+        last_samps = [gdf_info['nsamples'] - 1]
         super(RawGDF, self).__init__(
-            info, preload, last_samps=last_samps, orig_format='int',
+            info, preload, filenames=[input_fname], raw_extras=[gdf_info],
+            last_samps=last_samps, orig_format='int',
             verbose=verbose)
 
         logger.info('Ready.')
+
 
     def __repr__(self):
         n_chan = self.info['nchan']
@@ -134,17 +136,17 @@ class RawGDF(_BaseRaw):
         elif stop > self.last_samp + 1:
             stop = self.last_samp + 1
         sel = np.array(sel)
-
+        fi = 0
         #  Initial checks
         start = int(start)
         stop = int(stop)
 
-        buf_len = self._gdf_info['max_samp']
+        buf_len = self._raw_extras[fi]['max_samp']
         sfreq = self.info['sfreq']
         n_chan = self.info['nchan']
-        data_size = self._gdf_info['bpb']
-        data_offset = self._gdf_info['data_offset']
-        stim_channel = self._gdf_info['stim_channel']
+        data_size = self._raw_extras[fi]['bpb']
+        data_offset = self._raw_extras[fi]['data_offset']
+        stim_channel = self._raw_extras[fi]['stim_channel']
 
         # this is used to deal with indexing in the middle of a sampling period
         blockstart = int(floor(float(start) / buf_len) * buf_len)
@@ -163,10 +165,10 @@ class RawGDF(_BaseRaw):
         physical_range = np.array([ch['range'] for ch in self.info['chs']])
         cal = np.array([ch['cal'] for ch in self.info['chs']])
         cal = (physical_range) / (cal)
-        gains = np.atleast_2d(self._gdf_info['units'] * (cal))
+        gains = np.atleast_2d(self._raw_extras[fi]['units'] * (cal))
         # physical dimension in uV
-        physical_min = self._gdf_info['physical_min']
-        digital_min = self._gdf_info['digital_min']
+        physical_min = self._raw_extras[fi]['physical_min']
+        digital_min = self._raw_extras[fi]['digital_min']
         offsets = np.atleast_2d(physical_min - cal * digital_min).T
 
         picks = [stim_channel]
@@ -184,14 +186,14 @@ class RawGDF(_BaseRaw):
         read_size = blockstop - blockstart
 
         # does not support multiple data type
-        if len(np.unique(self._gdf_info['gdf_type_np'])) > 1:
+        if len(np.unique(self._raw_extras[fi]['gdf_type_np'])) > 1:
             raise("Multiple data type not supported")
 
         with open(self.info['filename'], 'rb', buffering=0) as fid:
             # extract data
             fid.seek(data_offset + blockstart * data_size)
 
-            gdftype = self._gdf_info['gdf_type_np']
+            gdftype = self._raw_extras[fi]['gdf_type_np']
             data = np.fromfile(fid, dtype=gdftype[0], count=read_size * n_chan)
             data = data.reshape((read_size, n_chan)).T
             data = np.float64(data)
@@ -209,8 +211,8 @@ class RawGDF(_BaseRaw):
                 stim[start - blockstart:stop - blockstart]
 
         logger.info('[done]')
-        times = np.arange(start, stop, dtype=float) / self.info['sfreq']
-        return data, times
+        # times = np.arange(start, stop, dtype=float) / self.info['sfreq']
+        return data
 
 
 def _get_gdf_info(fname, stim_channel, eog, misc, preload):
@@ -220,7 +222,7 @@ def _get_gdf_info(fname, stim_channel, eog, misc, preload):
         eog = []
     if misc is None:
         misc = []
-    info = _empty_info()
+    info = _empty_info(0)
     info['filename'] = fname
 
     gdf_info = dict()
